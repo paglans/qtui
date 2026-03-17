@@ -515,25 +515,25 @@ _LABEL_COLOR  = QColor(255, 255, 255, 220)
 _OVERLAYS = [
     # (region_name, img_x, img_y, rbv_pv, sp_pv, label)
     # Mirror
-    ("Mirror",       850,   500, "HIRRIXS3:MirrorAngle",       "HIRRIXS3:MirrorAngle",      "Mirror Angle"),
+    ("Mirror",       850,   500, "BL6013:MirrorAngle",       "BL6013:MirrorAngle",      "Mirror Angle"),
     # Grating
-    ("Grating",     1560,   350, "HIRRIXS3:GratingAngle",      "HIRRIXS3:GratingAngle",     "Grating Angle"),
+    ("Grating",     1560,   350, "BL6013:GratingAngle",      "BL6013:GratingAngle",     "Grating Angle"),
     # Optics
-    ("Optics",       900,  1120, "HIRRIXS4:SpectOpticsHeight",  "HIRRIXS4:SpectOpticsHeight", "Optics Height"),
-    ("Optics",       900,  1195, "HIRRIXS4:SpectOpticsPitch",   "HIRRIXS4:SpectOpticsPitch",  "Optics Pitch"),
-    ("Optics",       900,  1270, "HIRRIXS4:SpectOpticsRoll",    "HIRRIXS4:SpectOpticsRoll",   "Optics Roll"),
+    ("Optics",       900,  1120, "BL6013:SpectOpticsHeight", "BL6013:SpectOpticsHeight", "Optics Height"),
+    ("Optics",       900,  1195, "BL6013:SpectOpticsPitch",  "BL6013:SpectOpticsPitch",  "Optics Pitch"),
+    ("Optics",       900,  1270, "BL6013:SpectOpticsRoll",   "BL6013:SpectOpticsRoll",   "Optics Roll"),
     # Detector
-    ("Detector",    1600,  1100, "HIRRIXS3:DetectorX",          "HIRRIXS3:DetectorX",         "Detector X"),
-    ("Detector",    1600,  1175, "HIRRIXS3:DetectorZ",          "HIRRIXS3:DetectorZ",         "Detector Z"),
+    ("Detector",    1600,  1100, "BL6013:DetectorX",         "BL6013:DetectorX",         "Detector X"),
+    ("Detector",    1600,  1175, "BL6013:DetectorZ",         "BL6013:DetectorZ",         "Detector Z"),
     # Microscope
-    ("Microscope",   450,   250, "HIRRIXS2:MicroscopeX",        "HIRRIXS2:MicroscopeX",       "Microscope X"),
-    ("Microscope",   450,   325, "HIRRIXS2:MicroscopeY",        "HIRRIXS2:MicroscopeY",       "Microscope Y"),
-    ("Microscope",   450,   400, "HIRRIXS2:MicroscopeZ",        "HIRRIXS2:MicroscopeZ",       "Microscope Z"),
+    ("Microscope",   450,   250, "BL6013:MicroscopeX",       "BL6013:MicroscopeX",       "Microscope X"),
+    ("Microscope",   450,   325, "BL6013:MicroscopeY",       "BL6013:MicroscopeY",       "Microscope Y"),
+    ("Microscope",   450,   400, "BL6013:MicroscopeZ",       "BL6013:MicroscopeZ",       "Microscope Z"),
     # Sample / Manipulator
-    ("Sample",       220,   775, "HIRRIXS2:MainManipX",         "HIRRIXS2:MainManipX",        "Manip X"),
-    ("Sample",       220,   850, "HIRRIXS2:MainManipY",         "HIRRIXS2:MainManipY",        "Manip Y"),
-    ("Sample",       220,   925, "HIRRIXS2:MainManipZ",         "HIRRIXS2:MainManipZ",        "Manip Z"),
-    ("Sample",       220,  1000, "HIRRIXS2:MainManiptheta",     "HIRRIXS2:MainManiptheta",    "Manip θ"),
+    ("Sample",       220,   775, "BL6013:MainManipX",        "BL6013:MainManipX",        "Manip X"),
+    ("Sample",       220,   850, "BL6013:MainManipY",        "BL6013:MainManipY",        "Manip Y"),
+    ("Sample",       220,   925, "BL6013:MainManipZ",        "BL6013:MainManipZ",        "Manip Z"),
+    ("Sample",       220,  1000, "BL6013:MainManiptheta",    "BL6013:MainManiptheta",    "Manip θ"),
 ]
 
 
