@@ -1,0 +1,15 @@
+{
+	"areadetetor": {
+		"simDetector": "6013SIM1:Pva1",
+		"andor": "6013ANDOR:cam1"
+	},
+	"ai": {
+		"Izero133": "",
+		"Izero134": "",
+		"TEYup": "",
+		"TEYdn": "",
+		"TFY": "",
+		"Diode133": "",
+		"Diode134": ""
+	}
+}

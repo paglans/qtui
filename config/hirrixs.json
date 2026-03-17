@@ -1,0 +1,37 @@
+{
+	"hirrixs": {
+		"motor": {
+			"MainManipX": "HIRRIXS2:MainManipX",
+			"MainManipY": "HIRRIXS2:MainManipY",
+			"MainManipZ": "HIRRIXS2:MainManipZ",
+			"MainManiptheta": "HIRRIXS2:MainManiptheta",
+			"MirrorAngle": "HIRRIXS3:MirrorAngle",
+			"GratingAngle": "HIRRIXS3:GratingAngle",
+			"DetectorX": "HIRRIXS3:DetectorX",
+			"DetectorZ": "HIRRIXS3:DetectorZ",
+			"SpectOpticsPitch": "HIRRIXS4:SpectOpticsPitch",
+			"SpectOpticsRoll": "HIRRIXS4:SpectOpticsRoll",
+			"SpectOpticsHeight": "HIRRIXS4:SpectOpticsHeight",
+			"MicroscopeX": "HIRRIXS5:MicroscopeX",
+			"MicroscopeY": "HIRRIXS5:MicroscopeY",
+			"MicroscopeZ": "HIRRIXS5:MicroscopeZ"
+		},
+		"signal": {
+			"Izero133": "E1608:ai0",
+			"Diode133": "E1608:ai1",
+			"Izero134": "E1608:ai2",
+			"Diode134": "E1608:ai3",
+			"TEYup": "E1608:ai4",
+			"TEYdn": "E1608:ai5",
+			"TFYChanneltron": "E1608:ai6",
+			"TFYDiode": "E1608:ai7",
+		},
+		"detector":{
+			"simDetector": "6013SIM1",
+			"andor": "6013ANDOR"
+		},
+		"camera":{
+			"BeamSpot": "6013BeamSpot"
+		}
+	}
+}

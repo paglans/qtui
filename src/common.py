@@ -1,0 +1,228 @@
+"""
+common.py — shared constants, styles, helpers and the PVMonitor / PVLabel
+that are used by both tabs.
+"""
+import json, re, random
+from functools import partial
+from pathlib import Path
+
+from PySide6.QtWidgets import QLabel, QApplication
+from PySide6.QtCore import Qt, QTimer, Signal, QObject
+from PySide6.QtGui import QColor
+
+# ── Optional: pyepics ─────────────────────────────────────────────────────────
+try:
+    import epics
+    EPICS_AVAILABLE = True
+except ImportError:
+    EPICS_AVAILABLE = False
+    print("[INFO] pyepics not found – running in simulation mode")
+
+# ── Optional: qtepics ─────────────────────────────────────────────────────────
+try:
+    import qtepics          # noqa: F401
+    QTEPICS_AVAILABLE = True
+except ImportError:
+    QTEPICS_AVAILABLE = False
+
+# ── Optional: matplotlib ──────────────────────────────────────────────────────
+try:
+    import matplotlib
+    matplotlib.use("QtAgg")
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    import matplotlib.dates as mdates
+    MPL_AVAILABLE = True
+except ImportError:
+    MPL_AVAILABLE = False
+    print("[INFO] matplotlib not found – plots unavailable")
+
+# ── Optional: PySide6-WebEngine ───────────────────────────────────────────────
+try:
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWebEngineCore import QWebEngineSettings
+    WEBENGINE_AVAILABLE = True
+except ImportError:
+    WEBENGINE_AVAILABLE = False
+    print("[INFO] PySide6-WebEngine not found – ALS beam status frame unavailable")
+
+PYVISTA_AVAILABLE = False   # disabled: GLX conflict with QtWebEngine on X11
+
+# ── Palette ───────────────────────────────────────────────────────────────────
+PAL = {
+    "bg":       "#1a1a2e", "surface":  "#16213e",
+    "accent":   "#4fc3f7", "ok":       "#69f0ae",
+    "nc":       "#ef5350", "warn":     "#ffca28",
+    "text":     "#e0e0e0", "subtext":  "#9e9e9e",
+    "beam":     "#4fc3f7", "undulat":  "#81d4fa",
+    "mirror":   "#80cbc4", "diag":     "#ef9a9a",
+    "aperture": "#a5d6a7", "shutter":  "#ffab91",
+    "mono":     "#ce93d8", "hover":    "#1e3a5e",
+}
+def qc(k): return QColor(PAL[k])
+
+COMBO_STYLE = f"""
+    QComboBox {{ background:{PAL['surface']}; color:{PAL['text']};
+                 border:1px solid #2a3a5e; border-radius:4px;
+                 padding:4px 8px; min-width:140px; }}
+    QComboBox::drop-down {{ border:none; }}
+    QComboBox QAbstractItemView {{ background:{PAL['surface']}; color:{PAL['text']};
+                                   selection-background-color:#2a3a5e; }}
+"""
+BTN_STYLE = f"""
+    QPushButton {{ background:{PAL['surface']}; color:{PAL['accent']};
+                   border:1px solid {PAL['accent']}; border-radius:4px;
+                   padding:4px 12px; }}
+    QPushButton:hover   {{ background:#2a3a5e; }}
+    QPushButton:pressed {{ background:#1a2a4e; }}
+    QPushButton:disabled {{ color:#555; border-color:#333; }}
+"""
+GRP_STYLE = f"""
+    QGroupBox {{ color:{PAL['accent']}; border:1px solid #2a3a5e; border-radius:6px;
+                 margin-top:14px; font-weight:bold; font-size:9pt;
+                 background:{PAL['surface']}; }}
+    QGroupBox::title {{ subcontrol-origin:margin; left:10px; padding:0 4px; }}
+    QLabel {{ background:transparent; border:none; }}
+"""
+INPUT_STYLE = f"""
+    QLineEdit {{ background:{PAL['bg']}; color:{PAL['text']};
+                 border:1px solid #2a3a5e; border-radius:4px;
+                 padding:4px 6px; font-family:monospace; }}
+    QLineEdit:focus {{ border-color:{PAL['accent']}; }}
+"""
+SPLITTER_STYLE = f"""
+    QSplitter::handle {{ background:#2a3a5e; }}
+    QSplitter::handle:horizontal {{ width:4px; }}
+    QSplitter::handle:vertical   {{ height:4px; }}
+    QSplitter::handle:hover {{ background:{PAL['accent']}; }}
+"""
+TRACE_COLORS = [
+    "#4fc3f7","#69f0ae","#ffca28","#ef9a9a",
+    "#ce93d8","#80cbc4","#ffab91","#81d4fa",
+    "#a5d6a7","#f48fb1","#b39ddb","#fff176",
+]
+
+# ── JSON loader ───────────────────────────────────────────────────────────────
+def load_json(path):
+    try:
+        text = path.read_text()
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        return json.loads(text)
+    except FileNotFoundError:
+        print(f"[WARN] Config not found: {path}"); return {}
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] JSON: {path}: {e}"); return {}
+
+# ── PV Monitor ────────────────────────────────────────────────────────────────
+class _PVBridge(QObject):
+    value_changed = Signal(str, object)
+
+class PVMonitor:
+    _inst = None
+    def __new__(cls):
+        if cls._inst is None:
+            o = object.__new__(cls)
+            o._bridge = _PVBridge()
+            o._pvs: dict = {}
+            o._sim: dict = {}
+            if not EPICS_AVAILABLE:
+                o._timer = QTimer()
+                o._timer.timeout.connect(o._tick)
+                o._timer.start(1500)
+            cls._inst = o
+        return cls._inst
+
+    @property
+    def value_changed(self): return self._bridge.value_changed
+
+    def subscribe(self, name):
+        if not name or not isinstance(name, str) or name in self._pvs: return
+        if EPICS_AVAILABLE:
+            try:
+                self._pvs[name] = epics.PV(
+                    name, callback=partial(self._cb, name),
+                    auto_monitor=True,
+                    connection_callback=partial(self._ccb, name),
+                    connection_timeout=0.001)
+            except Exception as e:
+                print(f"[WARN] PV '{name}': {e}")
+                self._pvs[name] = None
+                self._bridge.value_changed.emit(name, None)
+        else:
+            self._sim[name] = round(random.uniform(0.5, 20.0), 4)
+            self._pvs[name] = None
+
+    def _cb(self, name, value=None, **_):
+        self._bridge.value_changed.emit(name, value)
+    def _ccb(self, name, conn=False, **_):
+        if not conn: self._bridge.value_changed.emit(name, None)
+    def _tick(self):
+        for n, v in list(self._sim.items()):
+            self._sim[n] = round(v + random.uniform(-0.05, 0.05), 4)
+            self._bridge.value_changed.emit(n, self._sim[n])
+    def get(self, name):
+        if EPICS_AVAILABLE:
+            p = self._pvs.get(name); return p.value if p else None
+        return self._sim.get(name)
+    def put(self, name, value):
+        if EPICS_AVAILABLE:
+            p = self._pvs.get(name)
+            if p: p.put(value)
+        else:
+            self._sim[name] = float(value)
+            self._bridge.value_changed.emit(name, float(value))
+
+# ── PV Label ──────────────────────────────────────────────────────────────────
+class PVLabel(QLabel):
+    def __init__(self, pv_name, fmt="{:.5g}", units="", parent=None):
+        super().__init__("…" if pv_name else "N/A", parent)
+        self._pv, self._fmt, self._units = pv_name, fmt, units
+        self.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.setMinimumWidth(72)
+        self.setStyleSheet("color:#9e9e9e; font-family:monospace;")
+        if not pv_name: return
+        mon = PVMonitor()
+        mon.subscribe(pv_name)
+        mon.value_changed.connect(self._on_value)
+        self._nc_timer = QTimer(self)
+        self._nc_timer.setSingleShot(True)
+        self._nc_timer.timeout.connect(self._on_timeout)
+        self._nc_timer.start(3000)
+
+    def _on_timeout(self):
+        if self.text() in ("…", "N/A"): self._show(None)
+    def _on_value(self, name, value):
+        if name == self._pv:
+            if hasattr(self, "_nc_timer"): self._nc_timer.stop()
+            self._show(value)
+    def _show(self, value):
+        if value is None:
+            self.setText("N/C"); self.setStyleSheet("color:#ef5350; font-family:monospace;")
+        else:
+            try:
+                s = self._fmt.format(float(value))
+                if self._units: s += f" {self._units}"
+                self.setText(s); self.setStyleSheet("color:#69f0ae; font-family:monospace;")
+            except Exception:
+                self.setText(str(value)[:14])
+                self.setStyleSheet("color:#ffca28; font-family:monospace;")
+
+# ── Table helper ──────────────────────────────────────────────────────────────
+from PySide6.QtWidgets import QGridLayout, QGroupBox
+from PySide6.QtGui import QFont
+
+def fill_table(grp: QGroupBox, rows):
+    grid = QGridLayout(grp); grid.setSpacing(5); grid.setContentsMargins(8,18,8,8)
+    for col, hdr in enumerate(["Name","PV","Value"]):
+        lbl = QLabel(hdr); lbl.setFont(QFont("Sans Serif",8,QFont.Bold))
+        lbl.setStyleSheet(f"color:{PAL['accent']}; background:transparent; border:none;")
+        grid.addWidget(lbl, 0, col)
+    for r, (name, pv) in enumerate(rows, 1):
+        nl = QLabel(name); nl.setFont(QFont("Sans Serif",8))
+        nl.setStyleSheet(f"color:{PAL['text']}; background:transparent; border:none;")
+        grid.addWidget(nl, r, 0)
+        pl = QLabel(pv); pl.setFont(QFont("Monospace",7))
+        pl.setStyleSheet(f"color:{PAL['subtext']}; background:transparent; border:none;")
+        pl.setMaximumWidth(190); grid.addWidget(pl, r, 1)
+        vl = PVLabel(pv); vl.setFont(QFont("Monospace",8)); grid.addWidget(vl, r, 2)
+    grid.setColumnStretch(0,1); grid.setColumnStretch(1,2); grid.setColumnStretch(2,1)

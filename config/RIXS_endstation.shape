@@ -1,0 +1,229 @@
+// RIXS Spectrometer Geometry
+// Beam direction: +z, Up: +y, Perpendicular: +x
+
+camera {
+    position -81.0 65.0 -120
+    orientation -0.95 -0.08 -0.87
+    fov 0.5
+    width 2222
+    height 1316
+}
+
+// === Incoming Photon Beam (along +z) ===
+define incomingBeam {
+    color 1 0.5 0 0.6  // orange, semi-transparent
+    translate 0 0 -125  // adjusted for half length
+    rotate 0 0 0.5
+    cylinder {
+        size 2 250  // halved from 500 to 250
+    }
+}
+incomingBeam
+
+// === Sample ===
+define sample {
+    color 0.7 0.7 0.9  // light blue for sample
+    cube {
+        size 10 10 0.4  // doubled from 5x5x0.2 to 10x10x0.4
+    }
+}
+sample
+
+// === Microscope (behind sample, along +z) ===
+define microscope {
+    color 0.3 0.3 0.3  // dark gray
+    translate 0 0 100  // positioned downstream of sample
+    rotate 0 0 0.5  // align with beam direction
+    // Microscope objective lens
+    cylinder {
+        size 30 60  // larger diameter, moderate length
+    }
+}
+microscope
+
+// === Spectrometer components (in -x direction) ===
+
+// Optical parameters
+define grazingAngle 0.1  // 18 degrees for visibility
+define mirrorDistance 200
+define gratingDistance 300
+define detectorDistance 600
+
+define mirrorLength 100
+define mirrorWidth 50
+define gratingLength 100
+define gratingWidth 50
+define detectorSize 80
+
+define gratingCenterY 50  // grating is above mirror
+define detectorCenterY -100  // detector position
+
+// === Scattered photons from sample to mirror ===
+define scatteredBeam1 {
+    color 1 1 0 0.4  // yellow, semi-transparent
+    translate -mirrorDistance/2 0 0
+    rotate 0.5 0 0  // rotate to point along x-axis
+    cylinder {
+        size 1 mirrorDistance
+    }
+}
+scatteredBeam1
+
+// === Combined platform under mirror and grating ===
+define platform {
+    color 0.5 0.5 0.5  // gray
+    // Platform spans from mirror to grating in x, centered in y
+    define platformLength gratingDistance - mirrorDistance + 60  // covers mirror to grating with margin
+    define platformCenterX -(mirrorDistance + gratingDistance) / 2
+    translate platformCenterX -30 0
+    cube {
+        size platformLength 10 120
+    }
+}
+platform
+
+// === Mirror (deflects up) ===
+define mirror {
+    color 0.9 0.9 0.95
+    translate -mirrorDistance 0 0
+    rotate 0.5 0 0  // 90° base rotation
+    rotate grazingAngle 0 0  // plus small grazing angle tilt
+    cube {
+        size 5 mirrorWidth mirrorLength
+    }
+}
+mirror
+
+// === Reflected photons from mirror to grating ===
+define scatteredBeam2 {
+    color 0 1 1 0.4  // cyan, semi-transparent
+    // Calculate path from mirror (-200, 0, 0) to grating (-300, 50, 0)
+    define deltaX -(gratingDistance - mirrorDistance)  // -100
+    define deltaY gratingCenterY  // 50
+    define pathLength sqrt(deltaX * deltaX + deltaY * deltaY)
+    define angleFromXAxis atan(deltaY / -deltaX) / pi  // angle in xy plane
+    
+    // Position at midpoint between mirror and grating
+    translate -(mirrorDistance + (gratingDistance - mirrorDistance)/2) gratingCenterY/2 0
+    // Single combined rotation to point from mirror to grating
+    rotate (0.5 + angleFromXAxis) 0 0
+    cylinder {
+        size 1 pathLength
+    }
+}
+scatteredBeam2
+
+// === Grating (deflects down) ===
+define grating {
+    color 0.8 0.7 0.5
+    translate -gratingDistance gratingCenterY 0
+    rotate 0.5 0 0  // 90° base rotation
+    rotate -grazingAngle 0 0  // plus small grazing angle tilt opposite direction
+    cube {
+        size 5 gratingWidth gratingLength
+    }
+}
+grating
+
+// === Dispersed photons from grating to detector ===
+define scatteredBeam3 {
+    color 1 0 1 0.4  // magenta, semi-transparent
+    // Calculate path from grating (-300, 50, 0) to detector (-600, -100, 0)
+    define deltaX -(detectorDistance - gratingDistance)  // -300
+    define deltaY detectorCenterY - gratingCenterY  // -150
+    define pathLength sqrt(deltaX * deltaX + deltaY * deltaY)
+    define angleFromXAxis atan(deltaY / -deltaX) / pi
+    
+    // Position at midpoint between grating and detector
+    translate -(gratingDistance + (detectorDistance - gratingDistance)/2) (gratingCenterY + detectorCenterY)/2 0
+    // Rotation to point from grating to detector
+    rotate (0.5 + angleFromXAxis) 0 0
+    cylinder {
+        size 1 pathLength
+    }
+}
+scatteredBeam3
+
+// === Detector (base) ===
+define detectorBase {
+    color 0.2 0.2 0.2
+    translate -detectorDistance detectorCenterY 0
+    cube {
+        size 10 detectorSize detectorSize
+    }
+}
+detectorBase
+
+// Rainbow gradient stripes on detector face
+define stripeHeight detectorSize / 7
+define stripeThickness 0.5
+
+// Red stripe
+define redStripe {
+    color 1 0 0
+    translate -detectorDistance + 5 detectorCenterY + 3 * stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+redStripe
+
+// Orange stripe
+define orangeStripe {
+    color 1 0.5 0
+    translate -detectorDistance + 5 detectorCenterY + 2 * stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+orangeStripe
+
+// Yellow stripe
+define yellowStripe {
+    color 1 1 0
+    translate -detectorDistance + 5 detectorCenterY + stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+yellowStripe
+
+// Green stripe
+define greenStripe {
+    color 0 1 0
+    translate -detectorDistance + 5 detectorCenterY 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+greenStripe
+
+// Blue stripe
+define blueStripe {
+    color 0 0 1
+    translate -detectorDistance + 5 detectorCenterY - stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+blueStripe
+
+// Indigo stripe
+define indigoStripe {
+    color 0.29 0 0.51
+    translate -detectorDistance + 5 detectorCenterY - 2 * stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+indigoStripe
+
+// Violet stripe
+define violetStripe {
+    color 0.56 0 1
+    translate -detectorDistance + 5 detectorCenterY - 3 * stripeHeight 0
+    cube {
+        size stripeThickness stripeHeight detectorSize
+    }
+}
+violetStripe

@@ -1,0 +1,52 @@
+{
+	"amber": {
+		"motor": {
+			"IVID": {
+				"GapCurrent": "SR06U___GDS1PS_AM00",
+				"GapRequest": "cmm:ID6_bl_input"
+			},
+			"M101": {
+				"M101Pitch": "BL0601:M101Pitch",
+				"M101Roll": "BL0601:M101Roll",
+			},
+			"DIAG101": "BL0601:DIAG101Pos",
+			"M102": "BL0601:M102Angle",
+			"G10x": "BL0601:G10xAngle",
+			"BeamlineEnergy": "BL0601:BeamlineEnergy",
+			"M131": {
+				"M131Pitch": "BL0601:M131Pitch",
+				"M131Roll": "BL0601:M131Roll"
+			},
+			"SLIT": "BL0601:SLIT131VertSize",
+			"SHTR131": {
+				"SHTR131Pos": "BL0601:SHTR131Pos",
+				"SHTR131PZT": "BL0601:SHTR131PZT"
+			},
+			"DIAG132": "BL0601:DIAG131Pos",
+			"AP131": {
+				"AP131Pos": "BL0601:AP131Pos",
+				"AP131Size": "BL0601:AP131Size"
+			},
+			"AP132": {
+				"AP132Pos": "BL0601:AP132Pos",
+				"AP132Size": "BL0601:AP132Size"
+			},
+			"M132": "BL0601:M132Pitch",
+			"M133": "BL0601:M133Pitch",
+			"DIAG133": "BL0601:DIAG133Pos",
+			"DIAG134": "BL0601:DIAG134Pos"
+		},
+		"signal": {
+			"IG001": "FE06BL0:IG001:Analog:Torr",
+			"IG002": "FE06BL0:IG002:Analog:Torr",
+			"IG101": "FE06BL0:IG101:Analog:Torr",
+			"IG102": "BL0601:IG102:Torr",
+			"IG103": "BL0601:IG103:Torr",
+			"IG104": "BL0601:IG104:Torr",
+			"IG105": "BL0601:IG105:Torr",
+			"IG131": "BL0601:IG131:Torr",
+			"DIAG132Diode": "BL601:DIAG132Diode",
+			"DIAG132TEY": "BL601:DIAG132TEY"
+		}
+	}
+}

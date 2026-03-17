@@ -1,0 +1,20 @@
+# Core GUI
+PySide6
+PySide6-WebEngine
+
+# EPICS / hardware
+pyepics
+ophyd
+
+# Bluesky stack (required for BLOP tab)
+bluesky
+databroker
+blop                  # pip install blop  OR  conda install -c conda-forge blop
+
+# Plotting
+matplotlib
+
+# Scientific (blop pulls these in, listed explicitly for clarity)
+numpy
+torch                 # BoTorch / blop backend
+botorch
