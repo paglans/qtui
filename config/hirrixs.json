@@ -1,20 +1,20 @@
 {
 	"hirrixs": {
 		"motor": {
-			"MainManipX": "HIRRIXS2:MainManipX",
-			"MainManipY": "HIRRIXS2:MainManipY",
-			"MainManipZ": "HIRRIXS2:MainManipZ",
-			"MainManiptheta": "HIRRIXS2:MainManiptheta",
-			"MirrorAngle": "HIRRIXS3:MirrorAngle",
-			"GratingAngle": "HIRRIXS3:GratingAngle",
-			"DetectorX": "HIRRIXS3:DetectorX",
-			"DetectorZ": "HIRRIXS3:DetectorZ",
-			"SpectOpticsPitch": "HIRRIXS4:SpectOpticsPitch",
-			"SpectOpticsRoll": "HIRRIXS4:SpectOpticsRoll",
-			"SpectOpticsHeight": "HIRRIXS4:SpectOpticsHeight",
-			"MicroscopeX": "HIRRIXS5:MicroscopeX",
-			"MicroscopeY": "HIRRIXS5:MicroscopeY",
-			"MicroscopeZ": "HIRRIXS5:MicroscopeZ"
+			"MainManipX": "BL6013:MainManipX",
+			"MainManipY": "BL6013:MainManipY",
+			"MainManipZ": "BL6013:MainManipZ",
+			"MainManiptheta": "BL6013:MainManiptheta",
+			"MirrorAngle": "BL6013:MirrorAngle",
+			"GratingAngle": "BL6013:GratingAngle",
+			"DetectorX": "BL6013:DetectorX",
+			"DetectorZ": "BL6013:DetectorZ",
+			"SpectOpticsPitch": "BL6013:SpectOpticsPitch",
+			"SpectOpticsRoll": "BL6013:SpectOpticsRoll",
+			"SpectOpticsHeight": "BL6013:SpectOpticsHeight",
+			"MicroscopeX": "BL6013:MicroscopeX",
+			"MicroscopeY": "BL6013:MicroscopeY",
+			"MicroscopeZ": "BL6013:MicroscopeZ"
 		},
 		"signal": {
 			"Izero133": "E1608:ai0",
