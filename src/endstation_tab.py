@@ -197,6 +197,8 @@ class DetectorImageViewer(QWidget):
     """
     _CMAPS   = ["viridis", "inferno", "gray", "plasma", "hot"]
     _IMG_SUF = ":RawImg"
+    _ACQ_SUF = ":cam1:Acquire"
+    _ACQ_RBV = ":cam1:Acquire_RBV"
 
     def __init__(self, detector_pvs: dict, parent=None):
         """
@@ -247,6 +249,13 @@ class DetectorImageViewer(QWidget):
         self._auto_btn.toggled.connect(self._on_auto_toggled)
         tb.addWidget(self._auto_btn)
 
+        self._acq_btn = QPushButton("▶ Acquire")
+        self._acq_btn.setStyleSheet(BTN_STYLE)
+        self._acq_btn.setFixedWidth(90)
+        self._acq_btn.setCheckable(True)
+        self._acq_btn.toggled.connect(self._on_acq_toggled)
+        tb.addWidget(self._acq_btn)
+
         # PVA status indicator
         self._pva_lbl = QLabel("PVA: —")
         self._pva_lbl.setFont(QFont("Monospace", 7))
@@ -288,9 +297,13 @@ class DetectorImageViewer(QWidget):
         self._status.setStyleSheet(f"color:{PAL['subtext']}; padding:2px 4px;")
         vl.addWidget(self._status)
 
-        # ── PVA bridge ───────────────────────────────────────────────────────
+        # PVA bridge
         self._bridge = _PVABridge(self)
         self._bridge.new_frame.connect(self._on_frame)
+
+        # CA monitor for Acquire_RBV
+        self._mon = PVMonitor()
+        self._mon.value_changed.connect(self._sync_acq_rbv)
 
         if PVA_AVAILABLE:
             self._pva_lbl.setText("PVA: ok")
@@ -324,7 +337,7 @@ class DetectorImageViewer(QWidget):
         prefix = self._det_pvs.get(name, "")
         pv = prefix + self._IMG_SUF if prefix else ""
         self._img_data = None
-        self._im = None          # force imshow rebuild for new detector
+        self._im = None
         if self._cbar is not None:
             try: self._cbar.remove()
             except: pass
@@ -333,7 +346,14 @@ class DetectorImageViewer(QWidget):
         if MPL_AVAILABLE:
             self._style_ax()
             self._canvas.draw_idle()
-        if pv:
+        # reset acquire button
+        self._acq_btn.blockSignals(True)
+        self._acq_btn.setChecked(False)
+        self._acq_btn.setText("▶ Acquire")
+        self._acq_btn.setStyleSheet(BTN_STYLE)
+        self._acq_btn.blockSignals(False)
+        if prefix:
+            self._mon.subscribe(prefix + self._ACQ_RBV)
             self._bridge.subscribe(pv)
             self._status.setText(f"Monitoring  {pv} …")
         else:
@@ -349,6 +369,42 @@ class DetectorImageViewer(QWidget):
         self._auto_btn.setText("Auto ✓" if checked else "Auto ✗")
         if checked and self._img_data is not None:
             self._render(self._img_data)
+
+    def _on_acq_toggled(self, checked: bool):
+        prefix = self._det_pvs.get(self._det_combo.currentText(), "")
+        if not prefix:
+            return
+        pv = prefix + self._ACQ_SUF
+        val = 1 if checked else 0
+        self._acq_btn.setText("■ Stop" if checked else "▶ Acquire")
+        self._acq_btn.setStyleSheet(
+            BTN_STYLE.replace("background:#1a2a4a", "background:#7a1a1a") if checked
+            else BTN_STYLE
+        )
+        try:
+            import epics
+            epics.caput(pv, val)
+        except ImportError:
+            print(f"[SIM] caput {pv} = {val}")
+
+    def _sync_acq_rbv(self, name: str, value):
+        """Keep the Acquire button in sync with the hardware RBV."""
+        prefix = self._det_pvs.get(self._det_combo.currentText(), "")
+        if not prefix or name != prefix + self._ACQ_RBV:
+            return
+        try:
+            acquiring = bool(int(value))
+        except (TypeError, ValueError):
+            return
+        # block signal to avoid retriggering caput
+        self._acq_btn.blockSignals(True)
+        self._acq_btn.setChecked(acquiring)
+        self._acq_btn.setText("■ Stop" if acquiring else "▶ Acquire")
+        self._acq_btn.setStyleSheet(
+            BTN_STYLE.replace("background:#1a2a4a", "background:#7a1a1a") if acquiring
+            else BTN_STYLE
+        )
+        self._acq_btn.blockSignals(False)
 
     def _on_frame(self, img: "np.ndarray"):
         """Slot — always called on Qt main thread via Signal."""
