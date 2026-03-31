@@ -17,14 +17,14 @@
 			"MicroscopeZ": "BL6013:MicroscopeZ"
 		},
 		"signal": {
-			"Izero133": "E1608:Ai1",
-			"Diode133": "E1608:Ai2",
-			"Izero134": "E1608:Ai3",
-			"Diode134": "E1608:Ai4",
-			"TEYup": "E1608:Ai5",
-			"TEYdn": "E1608:Ai6",
-			"TFYChanneltron": "E1608:Ai7",
-			"TFYDiode": "E1608:Ai8",
+			"Izero133": "6013E1608:Ai1",
+			"Diode133": "6013E1608:Ai2",
+			"Izero134": "6013E1608:Ai3",
+			"Diode134": "6013E1608:Ai4",
+			"TEYup": "6013E1608:Ai5",
+			"TEYdn": "6013E1608:Ai6",
+			"TFYChanneltron": "6013E1608:Ai7",
+			"TFYDiode": "6013E1608:Ai8",
 		},
 		"detector":{
 			"simDetector": "6013SIM1",

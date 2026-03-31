@@ -573,7 +573,7 @@ _OVERLAYS = [
     # Mirror
     ("Mirror",       850,   500, "BL6013:MirrorAngle",       "BL6013:MirrorAngle",      "Mirror Angle"),
     # Grating
-    ("Grating",     1560,   350, "BL6013:GratingAngle",      "BL6013:GratingAngle",     "Grating Angle"),
+    ("Grating",     1560,   350, "BL6013:GratingAnglealpha", "BL6013:GratingAnglealpha", "Grating Angle"),
     # Optics
     ("Optics",       900,  1120, "BL6013:SpectOpticsHeight", "BL6013:SpectOpticsHeight", "Optics Height"),
     ("Optics",       900,  1195, "BL6013:SpectOpticsPitch",  "BL6013:SpectOpticsPitch",  "Optics Pitch"),
