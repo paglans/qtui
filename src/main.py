@@ -13,6 +13,13 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--no-sandbox --disable-dev-shm-usage"
 )
 
+# Force CA context creation on the main thread before any PV subscriptions
+try:
+    import epics
+    epics.ca.initialize_libca()
+except Exception:
+    pass
+    
 import sys
 from pathlib import Path
 

@@ -13,10 +13,14 @@ from PySide6.QtGui import QColor
 # ── Optional: pyepics ─────────────────────────────────────────────────────────
 try:
     import epics
+    epics.ca.initialize_libca()   # force CA context onto the main thread now
     EPICS_AVAILABLE = True
 except ImportError:
     EPICS_AVAILABLE = False
     print("[INFO] pyepics not found – running in simulation mode")
+except Exception as e:
+    EPICS_AVAILABLE = False
+    print(f"[WARN] pyepics found but CA init failed: {e} – running in simulation mode")
 
 # ── Optional: qtepics ─────────────────────────────────────────────────────────
 try:
@@ -125,16 +129,26 @@ class PVMonitor:
             o._bridge = _PVBridge()
             o._pvs: dict = {}
             o._sim: dict = {}
-            if not EPICS_AVAILABLE:
+            if EPICS_AVAILABLE:
+                # Pump the CA context on the main thread so callbacks fire
+                o._poll_timer = QTimer()
+                o._poll_timer.timeout.connect(o._poll)
+                o._poll_timer.start(100)          # 100 ms — 10 Hz polling
+            else:
                 o._timer = QTimer()
                 o._timer.timeout.connect(o._tick)
                 o._timer.start(1500)
             cls._inst = o
         return cls._inst
 
+    def _poll(self):
+        try:
+            epics.ca.poll()
+        except Exception:
+            pass
+
     @property
     def value_changed(self): return self._bridge.value_changed
-
     def subscribe(self, name):
         if not name or not isinstance(name, str) or name in self._pvs: return
         if EPICS_AVAILABLE:
@@ -151,7 +165,6 @@ class PVMonitor:
         else:
             self._sim[name] = round(random.uniform(0.5, 20.0), 4)
             self._pvs[name] = None
-
     def _cb(self, name, value=None, **_):
         self._bridge.value_changed.emit(name, value)
     def _ccb(self, name, conn=False, **_):
