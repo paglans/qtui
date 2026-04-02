@@ -267,7 +267,8 @@ class DetectorImageViewer(QWidget):
 
         # ── matplotlib canvas ────────────────────────────────────────────────
         if MPL_AVAILABLE:
-            self._fig = Figure(facecolor=PAL["bg"], tight_layout=True)
+            self._fig = Figure(facecolor=PAL["bg"])
+            self._fig.subplots_adjust(left=0.1, right=0.85, top=0.92, bottom=0.1)
             self._ax  = self._fig.add_subplot(111)
             self._ch_v = self._ax.axvline(x=0, color="white", lw=0.7, ls="--", visible=False)
             self._ch_h = self._ax.axhline(y=0, color="white", lw=0.7, ls="--", visible=False)

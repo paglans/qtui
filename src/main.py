@@ -13,12 +13,6 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--no-sandbox --disable-dev-shm-usage"
 )
 
-# Force CA context creation on the main thread before any PV subscriptions
-try:
-    import epics
-    epics.ca.initialize_libca()
-except Exception:
-    pass
     
 import sys
 from pathlib import Path
@@ -102,6 +96,23 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("AMBER/HiRRIXS Control")
     app.setStyle("Fusion")
+
+    try:
+        import epics
+        epics.ca.initialize_libca()
+        # Diagnostic: test monitor callback directly
+        #def _test_cb(pvname=None, value=None, **kw):
+        #    print(f"[DIAG] monitor callback fired: {pvname} = {value}")
+        #pv = epics.PV('BL6013:MirrorAngle',
+        #              callback=_test_cb,
+        #              auto_monitor=True,
+        #              connection_timeout=0.001)
+        #print(f"[DIAG] PV created, connected={pv.connected}, value={pv.value}")
+    #except Exception as e:
+    except Exception:
+        pass
+        #print(f"[DIAG] epics error: {e}")
+
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

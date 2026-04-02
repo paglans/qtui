@@ -2,8 +2,8 @@
 	"amber": {
 		"motor": {
 			"IVID": {
-				"GapCurrent": "SR06U___GDS1PS_AM00",
-				"GapRequest": "cmm:ID6_bl_input"
+				"Gap": "SR06U___GDS1PS_AM00",
+				"GapReq": "cmm:ID6_bl_input"
 			},
 			"M101": {
 				"M101Pitch": "BL0601:M101Pitch",
@@ -22,7 +22,7 @@
 				"SHTR131Pos": "BL0601:SHTR131Pos",
 				"SHTR131PZT": "BL0601:SHTR131PZT"
 			},
-			"DIAG132": "BL0601:DIAG131Pos",
+			"DIAG132": "BL0601:DIAG132Insert",
 			"AP131": {
 				"AP131Pos": "BL0601:AP131Pos",
 				"AP131Size": "BL0601:AP131Size"
@@ -33,8 +33,8 @@
 			},
 			"M132": "BL0601:M132Pitch",
 			"M133": "BL0601:M133Pitch",
-			"DIAG133": "BL0601:DIAG133Pos",
-			"DIAG134": "BL0601:DIAG134Pos"
+			"DIAG133": "BL6013:DIAG133Insert",
+			"DIAG134": "BL6013:DIAG134Insert"
 		},
 		"signal": {
 			"IG001": "FE06BL0:IG001:Analog:Torr",

@@ -129,27 +129,35 @@ class PVMonitor:
             o._bridge = _PVBridge()
             o._pvs: dict = {}
             o._sim: dict = {}
-            if EPICS_AVAILABLE:
-                # Pump the CA context on the main thread so callbacks fire
-                o._poll_timer = QTimer()
-                o._poll_timer.timeout.connect(o._poll)
-                o._poll_timer.start(100)          # 100 ms — 10 Hz polling
-            else:
+            o._poll_timer = None   # created lazily
+            if not EPICS_AVAILABLE:
                 o._timer = QTimer()
                 o._timer.timeout.connect(o._tick)
                 o._timer.start(1500)
             cls._inst = o
         return cls._inst
 
+    def _ensure_poll_timer(self):
+        if EPICS_AVAILABLE and self._poll_timer is None:
+            self._poll_timer = QTimer()
+            self._poll_timer.timeout.connect(self._poll)
+            self._poll_timer.start(50)
+
     def _poll(self):
         try:
             epics.ca.poll()
+            # retry any PVs that failed to connect
+            for name, pv in list(self._pvs.items()):
+                if pv is not None and not pv.connected:
+                    epics.ca.poll(evt=0.01)
         except Exception:
             pass
 
     @property
     def value_changed(self): return self._bridge.value_changed
+
     def subscribe(self, name):
+        self._ensure_poll_timer()
         if not name or not isinstance(name, str) or name in self._pvs: return
         if EPICS_AVAILABLE:
             try:
@@ -190,6 +198,7 @@ class PVLabel(QLabel):
     def __init__(self, pv_name, fmt="{:.5g}", units="", parent=None):
         super().__init__("…" if pv_name else "N/A", parent)
         self._pv, self._fmt, self._units = pv_name, fmt, units
+        self._retries = 0
         self.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.setMinimumWidth(72)
         self.setStyleSheet("color:#9e9e9e; font-family:monospace;")
@@ -203,11 +212,24 @@ class PVLabel(QLabel):
         self._nc_timer.start(3000)
 
     def _on_timeout(self):
-        if self.text() in ("…", "N/A"): self._show(None)
+        if self.text() not in ("…", "N/A"):
+            return                          # already got a value, nothing to do
+        if self._retries < 5:
+            # re-subscribe and try again
+            self._retries += 1
+            mon = PVMonitor()
+            mon._pvs.pop(self._pv, None)    # remove stale entry so subscribe() runs again
+            mon.subscribe(self._pv)
+            self._nc_timer.start(3000)      # wait another 3 s
+        else:
+            self._show(None)               # give up after 5 retries (~15 s total)
+
     def _on_value(self, name, value):
         if name == self._pv:
             if hasattr(self, "_nc_timer"): self._nc_timer.stop()
+            self._retries = 0
             self._show(value)
+
     def _show(self, value):
         if value is None:
             self.setText("N/C"); self.setStyleSheet("color:#ef5350; font-family:monospace;")
@@ -219,7 +241,7 @@ class PVLabel(QLabel):
             except Exception:
                 self.setText(str(value)[:14])
                 self.setStyleSheet("color:#ffca28; font-family:monospace;")
-
+                
 # ── Table helper ──────────────────────────────────────────────────────────────
 from PySide6.QtWidgets import QGridLayout, QGroupBox
 from PySide6.QtGui import QFont
