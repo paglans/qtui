@@ -10,8 +10,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame,
     QSizePolicy, QComboBox, QPushButton, QDialog, QLineEdit,
     QProgressBar, QMessageBox, QSplitter, QGridLayout, QGroupBox,
+    QStackedWidget, QRadioButton, QDoubleSpinBox, QProgressBar,
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QRect, QUrl
+from PySide6.QtCore import Qt, QTimer, Signal, QRect, QUrl, QMetaObject, Q_ARG, Slot
 from PySide6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont,
     QLinearGradient, QCursor,
@@ -31,6 +32,11 @@ if MPL_AVAILABLE:
 if WEBENGINE_AVAILABLE:
     from PySide6.QtWebEngineWidgets import QWebEngineView
     from PySide6.QtWebEngineCore import QWebEngineSettings
+
+def _lbl(text):
+    l = QLabel(text)
+    l.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+    return l
 
 # ── Symbol widget ─────────────────────────────────────────────────────────────
 SYM_W, SYM_H = 100, 80
@@ -265,152 +271,339 @@ class StripChart(QWidget):
 SCAN_DWELL_MS = 300
 
 class ScanWindow(QDialog):
-    def __init__(self, comp_name, motor_pvs, all_signals, parent=None):
+    """
+    Modal dialog for scanning or jogging a motor while monitoring a signal.
+
+    Two modes selectable via radio buttons:
+      Scan       — sweep motor start→stop in N steps, plot signal vs position
+      Stripchart — jog motor ±step, live time-series + scatter plot
+    """
+    def __init__(self, title: str, motor_pvs: dict, signal_pvs: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Scan — {comp_name}")
-        self.resize(700, 540)
+        self.setWindowTitle(f"Scan / Stripchart — {title}")
+        self.resize(700, 600)
         self.setStyleSheet(f"background:{PAL['bg']}; color:{PAL['text']};")
-        self._motor_pvs = motor_pvs; self._all_signals = all_signals
-        self._scan_xs: list = []; self._scan_ys: list = []
-        self._scan_idx = 0; self._scanning = False
-        self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
 
-        root = QVBoxLayout(self); root.setContentsMargins(12,12,12,12); root.setSpacing(10)
-        ctrl = QGroupBox(f"Scan setup — {comp_name}"); ctrl.setStyleSheet(GRP_STYLE)
-        cl = QGridLayout(ctrl); cl.setContentsMargins(10,20,10,10); cl.setSpacing(8)
+        self._motor_pvs  = motor_pvs
+        self._signal_pvs = signal_pvs
+        self._scanning   = False
+        self._scan_thread = None
 
-        def qlbl(t):
-            l = QLabel(t); l.setStyleSheet(f"color:{PAL['subtext']};"); return l
+        # stripchart state
+        self._sc_times:  deque = deque(maxlen=200)
+        self._sc_signal: deque = deque(maxlen=200)
+        self._sc_pos:    deque = deque(maxlen=200)
+        self._sc_sig2:   deque = deque(maxlen=200)
+        self._t0 = None
+        self._last_pos = None
+        self._last_sig = None
 
-        cl.addWidget(qlbl("Motor (x-axis)"), 0, 0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        # ── mode selector ─────────────────────────────────────────────────────
+        mode_row = QHBoxLayout()
+        self._rb_scan = QRadioButton("Scan")
+        self._rb_sc   = QRadioButton("Stripchart")
+        self._rb_scan.setChecked(True)
+        for rb in (self._rb_scan, self._rb_sc):
+            rb.setStyleSheet(f"color:{PAL['text']}; font-size:9pt;")
+        mode_row.addWidget(self._rb_scan)
+        mode_row.addWidget(self._rb_sc)
+        mode_row.addStretch()
+        root.addLayout(mode_row)
+
+        # ── shared motor / signal combos ──────────────────────────────────────
+        combo_row = QHBoxLayout(); combo_row.setSpacing(12)
+        combo_row.addWidget(_lbl("Motor:"))
         self._motor_combo = QComboBox(); self._motor_combo.setStyleSheet(COMBO_STYLE)
-        for lbl in motor_pvs: self._motor_combo.addItem(lbl)
-        self._motor_combo.setEnabled(len(motor_pvs) > 1)
-        cl.addWidget(self._motor_combo, 0, 1, 1, 3)
-
-        cl.addWidget(qlbl("Signal (y-axis)"), 1, 0)
+        for n in motor_pvs: self._motor_combo.addItem(n)
+        combo_row.addWidget(self._motor_combo)
+        combo_row.addSpacing(12)
+        combo_row.addWidget(_lbl("Signal:"))
         self._sig_combo = QComboBox(); self._sig_combo.setStyleSheet(COMBO_STYLE)
-        for lbl in all_signals: self._sig_combo.addItem(lbl)
-        cl.addWidget(self._sig_combo, 1, 1, 1, 3)
+        for n in signal_pvs: self._sig_combo.addItem(n)
+        combo_row.addWidget(self._sig_combo)
+        combo_row.addStretch()
+        root.addLayout(combo_row)
 
-        for col, (lbl_txt, attr, default) in enumerate([
-            ("Start","_inp_start","0.0"),
-            ("Stop", "_inp_stop", "1.0"),
-            ("Step", "_inp_step", "0.1"),
-        ]):
-            cl.addWidget(qlbl(lbl_txt), 2, col*2)
-            inp = QLineEdit(default); inp.setStyleSheet(INPUT_STYLE); inp.setFixedWidth(90)
-            setattr(self, attr, inp); cl.addWidget(inp, 2, col*2+1)
-        root.addWidget(ctrl)
+        # ── stacked panels ────────────────────────────────────────────────────
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_scan_panel())
+        self._stack.addWidget(self._build_sc_panel())
+        root.addWidget(self._stack, 1)
+
+        self._rb_scan.toggled.connect(lambda on: self._stack.setCurrentIndex(0) if on else None)
+        self._rb_sc.toggled.connect(lambda on: self._stack.setCurrentIndex(1) if on else None)
+
+        # ── PV monitor ────────────────────────────────────────────────────────
+        self._mon = PVMonitor()
+        self._mon.value_changed.connect(self._on_pv)
+        for pv in list(motor_pvs.values()) + list(signal_pvs.values()):
+            self._mon.subscribe(pv)
+
+        # motor combo change → re-subscribe RBV
+        self._motor_combo.currentTextChanged.connect(self._on_motor_changed)
+        self._sig_combo.currentTextChanged.connect(self._on_sig_changed)
+        self._on_motor_changed(self._motor_combo.currentText())
+        self._on_sig_changed(self._sig_combo.currentText())
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _motor_pv(self):
+        return self._motor_pvs.get(self._motor_combo.currentText(), "")
+
+    def _sig_pv(self):
+        return self._signal_pvs.get(self._sig_combo.currentText(), "")
+
+    # ── scan panel ────────────────────────────────────────────────────────────
+    def _build_scan_panel(self):
+        w = QWidget(); w.setStyleSheet(f"background:{PAL['bg']};")
+        vl = QVBoxLayout(w); vl.setContentsMargins(0,0,0,0); vl.setSpacing(6)
+
+        param_row = QHBoxLayout(); param_row.setSpacing(8)
+        self._start = QDoubleSpinBox(); self._start.setRange(-1e6,1e6); self._start.setValue(0)
+        self._stop  = QDoubleSpinBox(); self._stop.setRange(-1e6,1e6);  self._stop.setValue(1)
+        self._step  = QDoubleSpinBox(); self._step.setRange(1e-6,1e6);  self._step.setValue(0.1)
+        for sb, lbl in ((self._start,"Start:"), (self._stop,"Stop:"), (self._step,"Step:")):
+            sb.setStyleSheet(INPUT_STYLE); sb.setFixedWidth(100)
+            param_row.addWidget(_lbl(lbl)); param_row.addWidget(sb)
+        self._prog = QProgressBar(); self._prog.setValue(0)
+        self._prog.setStyleSheet(
+            f"QProgressBar{{background:{PAL['surface']}; border:1px solid #2a3a5e;"
+            f" border-radius:3px; color:{PAL['text']};}}"
+            f"QProgressBar::chunk{{background:{PAL['accent']};}}")
+        param_row.addWidget(self._prog, 1)
+        vl.addLayout(param_row)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        self._scan_btn  = QPushButton("▶ Scan");  self._scan_btn.setStyleSheet(BTN_STYLE)
+        self._stop_btn  = QPushButton("■ Stop");  self._stop_btn.setStyleSheet(BTN_STYLE)
+        self._clear_btn = QPushButton("Clear");   self._clear_btn.setStyleSheet(BTN_STYLE)
+        self._done_btn  = QPushButton("Done");    self._done_btn.setStyleSheet(BTN_STYLE)
+        self._stop_btn.setEnabled(False)
+        for b in (self._scan_btn, self._stop_btn, self._clear_btn, self._done_btn):
+            b.setFixedWidth(80); btn_row.addWidget(b)
+        btn_row.addStretch()
+        self._scan_status = QLabel("Ready")
+        self._scan_status.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        btn_row.addWidget(self._scan_status)
+        vl.addLayout(btn_row)
 
         if MPL_AVAILABLE:
-            self._fig  = Figure(facecolor=PAL["surface"], tight_layout=True)
-            self._ax   = self._fig.add_subplot(111)
-            self._line, = self._ax.plot([], [], color=PAL["accent"],
-                                        linewidth=1.4, marker=".", markersize=4)
-            self._style_ax()
-            self._canvas = FigureCanvas(self._fig)
-            self._canvas.setStyleSheet("background:transparent;")
-            root.addWidget(self._canvas, 1)
-        else:
-            ph = QLabel("matplotlib not installed"); ph.setAlignment(Qt.AlignCenter)
-            ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
-            root.addWidget(ph, 1)
+            self._scan_fig = Figure(facecolor=PAL["bg"], tight_layout=True)
+            self._scan_ax  = self._scan_fig.add_subplot(111)
+            self._scan_line, = self._scan_ax.plot([], [], color=PAL["accent"],
+                                                   marker="o", markersize=4, linewidth=1)
+            self._style_ax(self._scan_ax, "Motor position", "Signal")
+            self._scan_canvas = FigureCanvas(self._scan_fig)
+            self._scan_canvas.setStyleSheet("background:transparent;")
+            vl.addWidget(self._scan_canvas, 1)
 
-        self._progress = QProgressBar(); self._progress.setValue(0)
-        self._progress.setTextVisible(False); self._progress.setFixedHeight(6)
-        self._progress.setStyleSheet(f"""
-            QProgressBar {{ background:{PAL['surface']}; border:none; border-radius:3px; }}
-            QProgressBar::chunk {{ background:{PAL['accent']}; border-radius:3px; }}
-        """)
-        root.addWidget(self._progress)
-
-        btn_row = QHBoxLayout()
-        self._scan_btn = QPushButton("▶  Scan"); self._scan_btn.setStyleSheet(BTN_STYLE)
-        self._stop_btn = QPushButton("■  Stop"); self._stop_btn.setStyleSheet(BTN_STYLE)
-        self._stop_btn.setEnabled(False)
-        self._clr_btn  = QPushButton("Clear");   self._clr_btn.setStyleSheet(BTN_STYLE)
-        done_btn       = QPushButton("Done");     done_btn.setStyleSheet(BTN_STYLE)
         self._scan_btn.clicked.connect(self._start_scan)
         self._stop_btn.clicked.connect(self._stop_scan)
-        self._clr_btn.clicked.connect(self._clear_plot)
-        done_btn.clicked.connect(self.accept)
-        for b in (self._scan_btn, self._stop_btn, self._clr_btn, done_btn):
-            btn_row.addWidget(b)
-        root.addLayout(btn_row)
+        self._clear_btn.clicked.connect(self._clear_scan)
+        self._done_btn.clicked.connect(self.accept)
+        return w
 
-    def _style_ax(self):
-        ax = self._ax; ax.set_facecolor(PAL["bg"])
+    # ── stripchart panel ──────────────────────────────────────────────────────
+    def _build_sc_panel(self):
+        w = QWidget(); w.setStyleSheet(f"background:{PAL['bg']};")
+        vl = QVBoxLayout(w); vl.setContentsMargins(0,0,0,0); vl.setSpacing(6)
+
+        ctrl_row = QHBoxLayout(); ctrl_row.setSpacing(8)
+        ctrl_row.addWidget(_lbl("Step size:"))
+        self._jog_step = QDoubleSpinBox()
+        self._jog_step.setRange(1e-6, 1e6); self._jog_step.setValue(0.1)
+        self._jog_step.setDecimals(4); self._jog_step.setStyleSheet(INPUT_STYLE)
+        self._jog_step.setFixedWidth(100)
+        ctrl_row.addWidget(self._jog_step)
+
+        ctrl_row.addSpacing(8)
+        self._rbv_lbl = QLabel("RBV: —")
+        self._rbv_lbl.setStyleSheet(
+            f"color:{PAL['ok']}; font-family:monospace; font-size:9pt;")
+        ctrl_row.addWidget(self._rbv_lbl)
+
+        ctrl_row.addSpacing(8)
+        self._up_btn   = QPushButton("▲ Step Up")
+        self._down_btn = QPushButton("▼ Step Down")
+        self._sc_clear = QPushButton("Clear")
+        self._sc_done  = QPushButton("Done")
+        for b in (self._up_btn, self._down_btn, self._sc_clear, self._sc_done):
+            b.setStyleSheet(BTN_STYLE); b.setFixedWidth(100)
+            ctrl_row.addWidget(b)
+        ctrl_row.addStretch()
+        vl.addLayout(ctrl_row)
+
+        if MPL_AVAILABLE:
+            splitter = QSplitter(Qt.Vertical)
+            splitter.setStyleSheet(SPLITTER_STYLE)
+
+            # time-series strip
+            self._ts_fig = Figure(facecolor=PAL["bg"], tight_layout=True)
+            self._ts_ax  = self._ts_fig.add_subplot(111)
+            self._ts_line, = self._ts_ax.plot([], [], color="#4fc3f7",
+                                               linewidth=1.2, marker=".", markersize=3)
+            self._style_ax(self._ts_ax, "Time (s)", "Signal")
+            self._ts_canvas = FigureCanvas(self._ts_fig)
+            self._ts_canvas.setStyleSheet("background:transparent;")
+            splitter.addWidget(self._ts_canvas)
+
+            # scatter: signal vs motor position
+            self._sc_fig = Figure(facecolor=PAL["bg"], tight_layout=True)
+            self._sc_ax  = self._sc_fig.add_subplot(111)
+            self._sc_scat, = self._sc_ax.plot([], [], color=PAL["accent"],
+                                               linestyle="none", marker="o", markersize=4)
+            self._style_ax(self._sc_ax, "Motor position", "Signal")
+            self._sc_canvas = FigureCanvas(self._sc_fig)
+            self._sc_canvas.setStyleSheet("background:transparent;")
+            splitter.addWidget(self._sc_canvas)
+
+            splitter.setSizes([250, 250])
+            vl.addWidget(splitter, 1)
+
+        self._up_btn.clicked.connect(lambda: self._jog(+1))
+        self._down_btn.clicked.connect(lambda: self._jog(-1))
+        self._sc_clear.clicked.connect(self._clear_sc)
+        self._sc_done.clicked.connect(self.accept)
+        return w
+
+    # ── shared axis style ─────────────────────────────────────────────────────
+    def _style_ax(self, ax, xlabel, ylabel):
+        ax.set_facecolor(PAL["bg"])
         for sp in ax.spines.values(): sp.set_color("#2a3a5e")
         ax.tick_params(colors=PAL["subtext"], labelsize=7)
+        ax.set_xlabel(xlabel, color=PAL["subtext"], fontsize=8)
+        ax.set_ylabel(ylabel, color=PAL["subtext"], fontsize=8)
         ax.grid(True, color="#2a3a5e", linewidth=0.5, linestyle="--")
 
-    def _refresh_labels(self):
-        if not MPL_AVAILABLE: return
-        mx = self._motor_combo.currentText(); sy = self._sig_combo.currentText()
-        self._ax.set_xlabel(f"{mx}  [{self._motor_pvs.get(mx,'')}]",
-                            color=PAL["subtext"], fontsize=8)
-        self._ax.set_ylabel(sy, color=PAL["subtext"], fontsize=8)
-        self._ax.set_title(f"{sy}  vs  {mx}", color=PAL["text"], fontsize=9)
-        self._canvas.draw_idle()
+    # ── PV callbacks ──────────────────────────────────────────────────────────
+    def _on_motor_changed(self, name):
+        self._current_motor_pv = self._motor_pvs.get(name, "")
 
-    def _clear_plot(self):
-        self._scan_xs.clear(); self._scan_ys.clear()
-        if MPL_AVAILABLE:
-            self._line.set_data([], []); self._ax.relim(); self._canvas.draw_idle()
-        self._progress.setValue(0)
+    def _on_sig_changed(self, name):
+        self._current_sig_pv = self._signal_pvs.get(name, "")
 
-    def _parse_inputs(self):
-        try:
-            start = float(self._inp_start.text())
-            stop  = float(self._inp_stop.text())
-            step  = float(self._inp_step.text())
-            if step == 0 or (stop-start)/step < 0: raise ValueError("invalid range")
-            return start, stop, step, max(1, round(abs((stop-start)/step))+1)
-        except ValueError as e:
-            QMessageBox.warning(self, "Input error", f"Bad scan parameters:\n{e}")
-            return None
+    def _on_pv(self, name, value):
+        if value is None: return
+        try: fv = float(value)
+        except: return
 
+        # update RBV label
+        if name == self._current_motor_pv:
+            self._last_pos = fv
+            self._rbv_lbl.setText(f"RBV: {fv:.6g}")
+
+        # stripchart update
+        if self._rb_sc.isChecked() and MPL_AVAILABLE:
+            if name == self._current_sig_pv:
+                self._last_sig = fv
+                if self._t0 is None: self._t0 = __import__("time").monotonic()
+                t = __import__("time").monotonic() - self._t0
+                self._sc_times.append(t)
+                self._sc_signal.append(fv)
+                self._ts_line.set_data(list(self._sc_times), list(self._sc_signal))
+                self._ts_ax.relim(); self._ts_ax.autoscale_view()
+                self._ts_canvas.draw_idle()
+
+            if name in (self._current_motor_pv, self._current_sig_pv):
+                if self._last_pos is not None and self._last_sig is not None:
+                    self._sc_pos.append(self._last_pos)
+                    self._sc_sig2.append(self._last_sig)
+                    self._sc_scat.set_data(list(self._sc_pos), list(self._sc_sig2))
+                    self._sc_ax.relim(); self._sc_ax.autoscale_view()
+                    self._sc_canvas.draw_idle()
+
+    # ── scan logic ────────────────────────────────────────────────────────────
     def _start_scan(self):
-        parsed = self._parse_inputs()
-        if parsed is None: return
-        start, stop, step, n = parsed
-        self._clear_plot()
-        self._positions = [start + i*abs(step)*(1 if stop>=start else -1) for i in range(n)]
-        self._scan_n = n; self._scan_idx = 0; self._scanning = True
-        self._progress.setMaximum(n); self._refresh_labels()
+        if self._scanning: return
+        mpv = self._motor_pv(); spv = self._sig_pv()
+        if not mpv or not spv:
+            self._scan_status.setText("⚠ Select motor and signal"); return
+        start = self._start.value(); stop = self._stop.value()
+        step  = self._step.value()
+        if step <= 0 or start == stop:
+            self._scan_status.setText("⚠ Invalid range"); return
+        import numpy as np
+        positions = np.arange(start, stop + step * 0.5, step)
+        self._scanning = True
         self._scan_btn.setEnabled(False); self._stop_btn.setEnabled(True)
-        self._scan_timer.start(SCAN_DWELL_MS)
+        self._clear_scan()
+        self._scan_xs, self._scan_ys = [], []
+        self._prog.setMaximum(len(positions)); self._prog.setValue(0)
 
-    def _scan_step(self):
-        if not self._scanning or self._scan_idx >= len(self._positions):
-            self._finish_scan(); return
-        x_pos    = self._positions[self._scan_idx]
-        motor_pv = self._motor_pvs.get(self._motor_combo.currentText(),"")
-        sig_pv   = self._all_signals.get(self._sig_combo.currentText(),"")
-        mon = PVMonitor()
-        if motor_pv: mon.put(motor_pv, x_pos)
-        if EPICS_AVAILABLE and sig_pv:
-            raw = mon.get(sig_pv); y = float(raw) if raw is not None else float("nan")
-        else:
-            mid = (self._positions[0]+self._positions[-1])/2
-            rng = abs(self._positions[-1]-self._positions[0]) or 1
-            y = math.exp(-0.5*((x_pos-mid)/(rng*0.2))**2) + random.gauss(0,0.05)
-        self._scan_xs.append(x_pos); self._scan_ys.append(y)
-        self._scan_idx += 1; self._progress.setValue(self._scan_idx)
+        import threading
+        self._scan_thread = threading.Thread(
+            target=self._scan_worker, args=(mpv, spv, positions), daemon=True)
+        self._scan_thread.start()
+
+    def _scan_worker(self, mpv, spv, positions):
+        import epics, time
+        for i, pos in enumerate(positions):
+            if not self._scanning: break
+            try: epics.caput(mpv, pos, wait=True)
+            except: pass
+            time.sleep(0.05)
+            val = self._mon.get(spv)
+            if val is not None:
+                QMetaObject.invokeMethod(
+                    self, "_scan_point", Qt.QueuedConnection,
+                    Q_ARG(float, float(pos)), Q_ARG(float, float(val)),
+                    Q_ARG(int, i+1))
+        QMetaObject.invokeMethod(self, "_scan_done", Qt.QueuedConnection)
+
+    @Slot(float, float, int)
+    def _scan_point(self, pos, val, n):
+        self._scan_xs.append(pos); self._scan_ys.append(val)
         if MPL_AVAILABLE:
-            self._line.set_data(self._scan_xs, self._scan_ys)
-            self._ax.relim(); self._ax.autoscale_view(); self._canvas.draw_idle()
-        if self._scan_idx >= len(self._positions): self._finish_scan()
+            self._scan_line.set_data(self._scan_xs, self._scan_ys)
+            self._scan_ax.relim(); self._scan_ax.autoscale_view()
+            self._scan_canvas.draw_idle()
+        self._prog.setValue(n)
+        self._scan_status.setText(f"Point {n}/{self._prog.maximum()}  pos={pos:.4g}  sig={val:.4g}")
+
+    @Slot()
+    def _scan_done(self):
+        self._scanning = False
+        self._scan_btn.setEnabled(True); self._stop_btn.setEnabled(False)
+        self._scan_status.setText("Done")
 
     def _stop_scan(self):
-        self._scanning = False; self._scan_timer.stop()
-        self._scan_btn.setEnabled(True); self._stop_btn.setEnabled(False)
+        self._scanning = False
 
-    def _finish_scan(self):
-        self._scanning = False; self._scan_timer.stop()
-        self._scan_btn.setEnabled(True); self._stop_btn.setEnabled(False)
-        self._progress.setValue(self._scan_n)
+    def _clear_scan(self):
+        self._scan_xs, self._scan_ys = [], []
+        if MPL_AVAILABLE:
+            self._scan_line.set_data([], [])
+            self._scan_ax.relim(); self._scan_canvas.draw_idle()
+        self._prog.setValue(0); self._scan_status.setText("Ready")
+
+    # ── jog logic ─────────────────────────────────────────────────────────────
+    def _jog(self, direction: int):
+        mpv = self._motor_pv()
+        if not mpv: return
+        cur = self._last_pos
+        if cur is None:
+            cur = self._mon.get(mpv)
+        if cur is None:
+            self._rbv_lbl.setText("RBV: N/C"); return
+        target = cur + direction * self._jog_step.value()
+        try:
+            import epics; epics.caput(mpv, target)
+        except ImportError:
+            print(f"[SIM] caput {mpv} = {target}")
+
+    def _clear_sc(self):
+        self._sc_times.clear(); self._sc_signal.clear()
+        self._sc_pos.clear();   self._sc_sig2.clear()
+        self._t0 = None; self._last_pos = None; self._last_sig = None
+        if MPL_AVAILABLE:
+            self._ts_line.set_data([], [])
+            self._ts_ax.relim(); self._ts_canvas.draw_idle()
+            self._sc_scat.set_data([], [])
+            self._sc_ax.relim(); self._sc_canvas.draw_idle()
+        self._rbv_lbl.setText("RBV: —")
 
 # ── Component Card ────────────────────────────────────────────────────────────
 CARD_W = 118
