@@ -685,8 +685,28 @@ class DAQTab(QWidget):
         )
         self._writer = ScanFileWriter()
         if not self._writer.open(fname, meta):
-            self._log_msg(f"⚠ Cannot open output file: {fname}", PAL["nc"])
             self._writer = None          # scan continues; data just not saved
+            self._log_msg(f"⚠ Cannot open output file: {fname}", PAL["nc"])
+            from PySide6.QtWidgets import QMessageBox
+            dlg = QMessageBox(self)
+            dlg.setWindowTitle("File Error")
+            dlg.setIcon(QMessageBox.Warning)
+            dlg.setText("Could not open scan output file.")
+            dlg.setInformativeText(
+                f"<b>{Path(fname).name}</b><br><br>"
+                f"Directory: <code>{Path(fname).parent}</code><br><br>"
+                + ("h5py is not installed — run <code>pip install h5py</code> "
+                   "or switch to CSV / SPEC format."
+                   if fname.endswith(".h5") and not H5_AVAILABLE
+                   else "Check that the directory exists and is writable.")
+            )
+            dlg.setStandardButtons(QMessageBox.Abort | QMessageBox.Ignore)
+            dlg.setDefaultButton(QMessageBox.Abort)
+            dlg.setStyleSheet(f"background:{PAL['surface']}; color:{PAL['text']};")
+            if dlg.exec() == QMessageBox.Abort:
+                self._set_state(_ScanState.IDLE)
+                self._reset_run_btns()
+                return
 
         self._scan_plot.reset(motor, det, f"{det}  vs  {motor}")
         self._progress.setMaximum(n)
