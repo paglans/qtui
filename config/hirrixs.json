@@ -14,7 +14,8 @@
 			"SpectOpticsHeight": "BL6013:SpectOpticsHeight",
 			"MicroscopeX": "BL6013:MicroscopeX",
 			"MicroscopeY": "BL6013:MicroscopeY",
-			"MicroscopeZ": "BL6013:MicroscopeZ"
+			"MicroscopeZ": "BL6013:MicroscopeZ",
+			"FakeMotor": "BL6013:FakeMotor"
 		},
 		"signal": {
 			"Izero133": "6013E1608:Ai1",

@@ -27,6 +27,15 @@ if MPL_AVAILABLE:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
 
+import csv
+import numpy as np
+
+try:
+    import h5py
+    H5_AVAILABLE = True
+except ImportError:
+    H5_AVAILABLE = False
+
 # ── Styles ────────────────────────────────────────────────────────────────────
 SPIN_STYLE = f"""
     QSpinBox, QDoubleSpinBox {{
@@ -189,6 +198,202 @@ class ScanPlot(QWidget):
                            color=PAL["ok"], fontsize=9)
         self._canvas.draw_idle()
 
+
+
+class ScanFileWriter:
+    """Writes 1-D scan data to HDF5, CSV, or SPEC (.dat) files.
+
+    Lifecycle
+    ---------
+    writer = ScanFileWriter()
+    writer.open(path, meta)     # scan start  → writes file header
+    writer.write_point(x, y)   # each step   → flushes immediately
+    writer.close()              # scan end    → finalises and closes
+    writer.close(aborted=True)  # on abort    → marks partial and closes
+    """
+
+    FMT_HDF5 = 0
+    FMT_CSV  = 1
+    FMT_SPEC = 2
+
+    def __init__(self):
+        self._fmt      = None
+        self._path     = None
+        self._meta: dict = {}
+        self._xs: list = []
+        self._ys: list = []
+        # format-specific handles
+        self._h5file   = None
+        self._csvfile  = None
+        self._csvwriter = None
+        self._specfile = None
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def open(self, path: str, meta: dict) -> bool:
+        """Open file and write header.
+
+        Parameters
+        ----------
+        path : str
+            Full output path (extension determines format).
+        meta : dict
+            Keys used: motor, detector, start, stop, steps,
+                       exposure, scan_num.
+
+        Returns True on success.
+        """
+        self._path = path
+        self._meta = meta
+        self._xs   = []
+        self._ys   = []
+        ext = Path(path).suffix.lower()
+        self._fmt = {".h5": self.FMT_HDF5,
+                     ".csv": self.FMT_CSV,
+                     ".dat": self.FMT_SPEC}.get(ext, self.FMT_CSV)
+        try:
+            if   self._fmt == self.FMT_HDF5: return self._open_hdf5()
+            elif self._fmt == self.FMT_CSV:  return self._open_csv()
+            else:                            return self._open_spec()
+        except Exception as exc:
+            print(f"[ScanFileWriter] open error: {exc}")
+            return False
+
+    def write_point(self, x: float, y: float):
+        """Append one (x, y) point and flush to disk."""
+        self._xs.append(x)
+        self._ys.append(y)
+        try:
+            if self._fmt == self.FMT_CSV and self._csvwriter:
+                self._csvwriter.writerow([f"{x:.6g}", f"{y:.6g}"])
+                self._csvfile.flush()
+            elif self._fmt == self.FMT_SPEC and self._specfile:
+                self._specfile.write(f"  {x:.6g}  {y:.6g}\n")
+                self._specfile.flush()
+            # HDF5: buffer in-memory; written as contiguous arrays on close
+        except Exception as exc:
+            print(f"[ScanFileWriter] write_point error: {exc}")
+
+    def close(self, aborted: bool = False):
+        """Finalise and close the file."""
+        try:
+            if   self._fmt == self.FMT_HDF5: self._close_hdf5(aborted)
+            elif self._fmt == self.FMT_CSV:  self._close_csv(aborted)
+            elif self._fmt == self.FMT_SPEC: self._close_spec(aborted)
+        except Exception as exc:
+            print(f"[ScanFileWriter] close error: {exc}")
+
+    # ── HDF5 ──────────────────────────────────────────────────────────────────
+
+    def _open_hdf5(self) -> bool:
+        if not H5_AVAILABLE:
+            raise RuntimeError("h5py not installed — run: pip install h5py")
+        self._h5file = h5py.File(self._path, "w")
+        grp  = self._h5file.create_group("scan")
+        meta = grp.create_group("metadata")
+        for k, v in self._meta.items():
+            meta.attrs[k] = str(v)
+        meta.attrs["timestamp"]   = datetime.now().isoformat()
+        meta.attrs["file_format"] = "AMBER_HiRRIXS_HDF5_v1"
+        meta.attrs["beamline"]    = "ALS BL601 AMBER"
+        return True
+
+    def _close_hdf5(self, aborted: bool):
+        if not self._h5file:
+            return
+        grp  = self._h5file["scan"]
+        data = grp.create_group("data")
+        xs   = np.array(self._xs, dtype=np.float64)
+        ys   = np.array(self._ys, dtype=np.float64)
+        motor_name = self._meta.get("motor", "motor")
+        det_name   = self._meta.get("detector", "detector")
+        ds_x = data.create_dataset(motor_name, data=xs)
+        ds_y = data.create_dataset(det_name,   data=ys)
+        ds_x.attrs["units"] = "user"
+        ds_y.attrs["units"] = "counts"
+        grp.attrs["n_points"] = len(xs)
+        grp.attrs["aborted"]  = aborted
+        self._h5file.close()
+        self._h5file = None
+
+    # ── CSV ───────────────────────────────────────────────────────────────────
+
+    def _open_csv(self) -> bool:
+        m = self._meta
+        self._csvfile = open(self._path, "w", newline="")
+        # Comment block
+        for line in [
+            f"# AMBER HiRRIXS scan — {Path(self._path).stem}",
+            f"# Date:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Beamline: ALS BL601 AMBER",
+            f"# Motor:    {m.get('motor','?')}",
+            f"# Detector: {m.get('detector','?')}",
+            f"# Range:    {m.get('start','?')} → {m.get('stop','?')}  "
+            f"({m.get('steps','?')} steps)",
+            f"# Exposure: {m.get('exposure','?')} s",
+            f"# Scan #:   {m.get('scan_num','?')}",
+        ]:
+            self._csvfile.write(line + "\n")
+        self._csvwriter = csv.writer(self._csvfile)
+        self._csvwriter.writerow([m.get("motor", "motor"),
+                                  m.get("detector", "detector")])
+        self._csvfile.flush()
+        return True
+
+    def _close_csv(self, aborted: bool):
+        if not self._csvfile:
+            return
+        if aborted:
+            self._csvfile.write(
+                f"# Scan aborted after {len(self._xs)} points\n")
+        self._csvfile.close()
+        self._csvfile   = None
+        self._csvwriter = None
+
+    # ── SPEC (.dat) ───────────────────────────────────────────────────────────
+
+    def _open_spec(self) -> bool:
+        """Writes a SPEC-compatible file header (standard synchrotron format)."""
+        m   = self._meta
+        now = datetime.now()
+        motor    = m.get("motor",    "motor")
+        det      = m.get("detector", "detector")
+        start    = m.get("start",    0)
+        stop     = m.get("stop",     1)
+        steps    = m.get("steps",    1)
+        exposure = m.get("exposure", 1.0)
+        scan_num = m.get("scan_num", 1)
+
+        self._specfile = open(self._path, "w")
+        f = self._specfile
+        # File-level header
+        f.write(f"#F {Path(self._path).name}\n")
+        f.write(f"#E {int(now.timestamp())}\n")
+        f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
+        f.write(f"#C AMBER HiRRIXS  ALS BL601  "
+                f"User={m.get('prefix','scan')}\n")
+        f.write("\n")
+        # Scan header
+        f.write(f"#S {scan_num} ascan {motor} {start} {stop} "
+                f"{steps - 1} {exposure}\n")
+        f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
+        f.write(f"#T {exposure}  (Seconds)\n")
+        f.write(f"#N 2\n")
+        f.write(f"#L {motor}  {det}\n")
+        f.flush()
+        return True
+
+    def _close_spec(self, aborted: bool):
+        if not self._specfile:
+            return
+        if aborted:
+            self._specfile.write(
+                f"#C Scan aborted after {len(self._xs)} points\n")
+        self._specfile.write("\n")      # blank line terminates scan block
+        self._specfile.close()
+        self._specfile = None
+
+
 # ── DAQ Tab ───────────────────────────────────────────────────────────────────
 SCAN_DWELL_MS = 200
 
@@ -197,6 +402,7 @@ class DAQTab(QWidget):
         super().__init__(parent)
         self.setStyleSheet(f"background:{PAL['bg']};")
         self._state = _ScanState.IDLE
+        self._writer: ScanFileWriter | None = None
         self._scan_idx = 0; self._scan_positions: list = []
         self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
 
@@ -453,27 +659,49 @@ class DAQTab(QWidget):
 
     # ── Scan engine ───────────────────────────────────────────────────────────
     def _start_scan(self):
-        if self._state == _ScanState.RUNNING: return
+        if self._state == _ScanState.RUNNING:
+            return
         n     = self._p_steps.value()
         start = self._p_start.value()
         stop  = self._p_stop.value()
         step  = (stop - start) / max(n - 1, 1)
-        self._scan_positions = [start + i*step for i in range(n)]
-        self._scan_idx       = 0
-        self._scan_t0        = time.monotonic()
-        fname = self._current_filename()
-        motor = self._motor_combo.currentText()
-        det   = self._det_combo.currentText()
+        self._scan_positions = [start + i * step for i in range(n)]
+        self._scan_idx  = 0
+        self._scan_t0   = time.monotonic()
+        fname  = self._current_filename()
+        motor  = self._motor_combo.currentText()
+        det    = self._det_combo.currentText()
+
+        # ── Open file writer ──────────────────────────────────────────────────
+        meta = dict(
+            motor    = motor,
+            detector = det,
+            start    = start,
+            stop     = stop,
+            steps    = n,
+            exposure = self._p_exp.value(),
+            scan_num = self._scan_num.value(),
+            prefix   = self._prefix_edit.text().strip() or "scan",
+        )
+        self._writer = ScanFileWriter()
+        if not self._writer.open(fname, meta):
+            self._log_msg(f"⚠ Cannot open output file: {fname}", PAL["nc"])
+            self._writer = None          # scan continues; data just not saved
+
         self._scan_plot.reset(motor, det, f"{det}  vs  {motor}")
-        self._progress.setMaximum(n); self._progress.setValue(0)
+        self._progress.setMaximum(n)
+        self._progress.setValue(0)
         self._st_file.setText(Path(fname).name)
-        self._st_file.setStyleSheet(f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
+        self._st_file.setStyleSheet(
+            f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
         self._log_msg(f"▶ Scan started  →  {fname}", PAL["ok"])
-        self._log_msg(f"   Motor: {motor}  |  Det: {det}  |  {n} points  "
-                      f"[{start:.4g} → {stop:.4g}]")
+        self._log_msg(
+            f"   Motor: {motor}  |  Det: {det}  |  {n} points  "
+            f"[{start:.4g} → {stop:.4g}]")
         self._set_state(_ScanState.RUNNING)
         self._run_btn.setEnabled(False)
-        self._pause_btn.setEnabled(True); self._abort_btn.setEnabled(True)
+        self._pause_btn.setEnabled(True)
+        self._abort_btn.setEnabled(True)
         self._scan_timer.start(SCAN_DWELL_MS)
 
     def _pause_scan(self):
@@ -491,21 +719,29 @@ class DAQTab(QWidget):
     def _abort_scan(self):
         self._scan_timer.stop()
         self._set_state(_ScanState.ABORTING)
+
+        # ── Finalise (partial) file ───────────────────────────────────────────
+        if self._writer is not None:
+            self._writer.close(aborted=True)
+            self._writer = None
+
         self._log_msg("■ Scan aborted.", PAL["nc"])
         self._scan_plot.finish("Scan aborted")
         self._reset_run_btns()
 
     def _scan_step(self):
         if self._state != _ScanState.RUNNING:
-            self._scan_timer.stop(); return
+            self._scan_timer.stop()
+            return
         if self._scan_idx >= len(self._scan_positions):
-            self._finish_scan(); return
+            self._finish_scan()
+            return
 
-        x   = self._scan_positions[self._scan_idx]
-        pv  = self._motor_pvs.get(self._motor_combo.currentText(), "")
-        if pv: PVMonitor().put(pv, x)
+        x  = self._scan_positions[self._scan_idx]
+        pv = self._motor_pvs.get(self._motor_combo.currentText(), "")
+        if pv:
+            PVMonitor().put(pv, x)
 
-        # Read detector (simulated if no EPICS)
         sig_pv = ({**self._signal_pvs, **self._det_pvs}
                   .get(self._det_combo.currentText(), ""))
         if EPICS_AVAILABLE and sig_pv:
@@ -514,15 +750,21 @@ class DAQTab(QWidget):
         else:
             mid = (self._scan_positions[0] + self._scan_positions[-1]) / 2
             rng = abs(self._scan_positions[-1] - self._scan_positions[0]) or 1
-            y   = (500 * math.exp(-0.5*((x-mid)/(rng*0.15))**2)
+            y   = (500 * math.exp(-0.5 * ((x - mid) / (rng * 0.15)) ** 2)
                    + random.gauss(0, 5))
 
         self._scan_plot.add_point(x, y)
+
+        # ── Write point to file ───────────────────────────────────────────────
+        if self._writer is not None:
+            self._writer.write_point(x, y)
+
         self._scan_idx += 1
         self._progress.setValue(self._scan_idx)
         elapsed = time.monotonic() - self._scan_t0
         self._st_elapsed.setText(f"{elapsed:.1f} s")
-        self._st_point.setText(f"{self._scan_idx} / {len(self._scan_positions)}")
+        self._st_point.setText(
+            f"{self._scan_idx} / {len(self._scan_positions)}")
 
         if self._scan_idx >= len(self._scan_positions):
             self._finish_scan()
@@ -530,6 +772,12 @@ class DAQTab(QWidget):
     def _finish_scan(self):
         self._scan_timer.stop()
         fname = self._current_filename()
+
+        # ── Finalise file ─────────────────────────────────────────────────────
+        if self._writer is not None:
+            self._writer.close(aborted=False)
+            self._writer = None
+
         self._scan_plot.finish(f"Scan complete — {Path(fname).name}")
         self._log_msg(f"✔ Scan complete.  File: {fname}", PAL["ok"])
         if self._auto_inc.isChecked():
