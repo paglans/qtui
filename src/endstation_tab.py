@@ -470,7 +470,7 @@ _REGIONS = [
     ("Optics",      1260,  915,  550, 200, ["SpectOpticsHeight", "SpectOpticsPitch",
                                             "SpectOpticsRoll"]),
     ("Grating",     1560,  490,  555, 200, ["GratingAngle"]),
-    ("Detector",    1890,  810,  330, 260, ["DetectorX", "DetectorY"]),
+    ("Detector",    1890,  810,  330, 260, ["DetectorX", "DetectorZ"]),
 ]
 _HOVER_COLOR  = QColor(255, 220,  80, 90)
 _BORDER_COLOR = QColor(255, 220,  80, 200)

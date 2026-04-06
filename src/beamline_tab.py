@@ -306,8 +306,10 @@ class ScanWindow(QDialog):
         self.resize(700, 600)
         self.setStyleSheet(f"background:{PAL['bg']}; color:{PAL['text']};")
 
-        self._motor_pvs  = motor_pvs
-        self._signal_pvs = signal_pvs
+        #self._motor_pvs  = motor_pvs
+        #self._signal_pvs = signal_pvs
+        self._motor_pvs  = {k: v for k, v in motor_pvs.items()  if v}
+        self._signal_pvs = {k: v for k, v in signal_pvs.items() if v}
         self._scanning   = False
         self._scan_thread = None
 
@@ -338,15 +340,37 @@ class ScanWindow(QDialog):
 
         # ── shared motor / signal combos ──────────────────────────────────────
         combo_row = QHBoxLayout(); combo_row.setSpacing(12)
-        combo_row.addWidget(_lbl("Motor:"))
+
+        # Motor column
+        motor_col = QVBoxLayout(); motor_col.setSpacing(2)
+        motor_top = QHBoxLayout(); motor_top.setSpacing(6)
+        motor_top.addWidget(_lbl("Motor:"))
         self._motor_combo = QComboBox(); self._motor_combo.setStyleSheet(COMBO_STYLE)
         for n in motor_pvs: self._motor_combo.addItem(n)
-        combo_row.addWidget(self._motor_combo)
+        motor_top.addWidget(self._motor_combo)
+        motor_col.addLayout(motor_top)
+        self._motor_cur = QLabel("Position: —")
+        self._motor_cur.setStyleSheet(
+            f"color:{PAL['ok']}; font-family:monospace; font-size:8pt; padding-left:4px;")
+        motor_col.addWidget(self._motor_cur)
+        combo_row.addLayout(motor_col)
+
         combo_row.addSpacing(12)
-        combo_row.addWidget(_lbl("Signal:"))
+
+        # Signal column
+        sig_col = QVBoxLayout(); sig_col.setSpacing(2)
+        sig_top = QHBoxLayout(); sig_top.setSpacing(6)
+        sig_top.addWidget(_lbl("Signal:"))
         self._sig_combo = QComboBox(); self._sig_combo.setStyleSheet(COMBO_STYLE)
         for n in signal_pvs: self._sig_combo.addItem(n)
-        combo_row.addWidget(self._sig_combo)
+        sig_top.addWidget(self._sig_combo)
+        sig_col.addLayout(sig_top)
+        self._sig_cur = QLabel("Value: —")
+        self._sig_cur.setStyleSheet(
+            f"color:{PAL['accent']}; font-family:monospace; font-size:8pt; padding-left:4px;")
+        sig_col.addWidget(self._sig_cur)
+        combo_row.addLayout(sig_col)
+
         combo_row.addStretch()
         root.addLayout(combo_row)
 
@@ -365,9 +389,13 @@ class ScanWindow(QDialog):
         for pv in list(motor_pvs.values()) + list(signal_pvs.values()):
             self._mon.subscribe(pv)
 
-        # motor combo change → re-subscribe RBV
+        # motor/signal combo changes
         self._motor_combo.currentTextChanged.connect(self._on_motor_changed)
         self._sig_combo.currentTextChanged.connect(self._on_sig_changed)
+
+        # initialise current PV names and populate labels immediately
+        self._current_motor_pv = ""
+        self._current_sig_pv   = ""
         self._on_motor_changed(self._motor_combo.currentText())
         self._on_sig_changed(self._sig_combo.currentText())
 
@@ -503,19 +531,43 @@ class ScanWindow(QDialog):
     # ── PV callbacks ──────────────────────────────────────────────────────────
     def _on_motor_changed(self, name):
         self._current_motor_pv = self._motor_pvs.get(name, "")
+        self._last_pos = None
+        self._motor_cur.setText("Position: —")
+        self._rbv_lbl.setText("RBV: —")
+        if self._current_motor_pv:
+            val = self._mon.get(self._current_motor_pv)
+            if val is not None:
+                try:
+                    fv = float(val)
+                    self._last_pos = fv
+                    self._motor_cur.setText(f"Position: {fv:.6g}")
+                    self._rbv_lbl.setText(f"RBV: {fv:.6g}")
+                except (TypeError, ValueError):
+                    pass
 
     def _on_sig_changed(self, name):
         self._current_sig_pv = self._signal_pvs.get(name, "")
+        self._sig_cur.setText("Value: —")
+        if self._current_sig_pv:
+            val = self._mon.get(self._current_sig_pv)
+            if val is not None:
+                try:
+                    self._sig_cur.setText(f"Value: {float(val):.6g}")
+                except (TypeError, ValueError):
+                    pass
 
     def _on_pv(self, name, value):
         if value is None: return
         try: fv = float(value)
         except: return
 
-        # update RBV label
         if name == self._current_motor_pv:
             self._last_pos = fv
             self._rbv_lbl.setText(f"RBV: {fv:.6g}")
+            self._motor_cur.setText(f"Position: {fv:.6g}")
+
+        if name == self._current_sig_pv:
+            self._sig_cur.setText(f"Value: {fv:.6g}")
 
         # stripchart update
         if self._rb_sc.isChecked() and MPL_AVAILABLE:
@@ -834,6 +886,8 @@ class BeamlineTab(QWidget):
 
         def add(name, kind, pvs, motor_pvs=None):
             scan_motors = motor_pvs if motor_pvs is not None else pvs
+            # strip empty PV strings so they don't appear in the scan combo
+            scan_motors = {k: v for k, v in scan_motors.items() if v}
             card = ComponentCard(name, kind, pvs)
             card.clicked.connect(partial(self._open_scan, name, scan_motors))
             cards.append(card)
