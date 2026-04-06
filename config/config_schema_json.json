@@ -1,0 +1,198 @@
+{
+  "_comment": "Schema for configuration.json.  Each leaf key maps to a descriptor.",
+  "_descriptor_keys": {
+    "type":        "string | int | float | bool | choice",
+    "label":       "Human-readable field label shown in the UI",
+    "unit":        "Optional unit string appended to the label",
+    "description": "Tooltip text",
+    "default":     "Value written when creating a fresh configuration.json",
+    "min":         "Inclusive minimum (int/float only)",
+    "max":         "Inclusive maximum (int/float only)",
+    "step":        "Spin-box step size (int/float only)",
+    "decimals":    "Decimal places shown (float only)",
+    "choices":     "Allowed values (choice type only)",
+    "live":        "Dotted key emitted via config_changed on save (omit if no live effect)"
+  },
+
+  "general": {
+    "facility": {
+      "type":        "string",
+      "label":       "Facility",
+      "description": "Name of the synchrotron facility",
+      "default":     "ALS"
+    },
+    "beamline": {
+      "type":        "string",
+      "label":       "Beamline ID",
+      "description": "Beamline identifier (e.g. BL601)",
+      "default":     "BL601"
+    },
+    "endstation": {
+      "type":        "string",
+      "label":       "Endstation",
+      "description": "Name of the endstation",
+      "default":     "HiRRIXS"
+    },
+    "operator_email": {
+      "type":        "string",
+      "label":       "Operator e-mail",
+      "description": "Contact address for automated notifications",
+      "default":     "operator@lbl.gov"
+    }
+  },
+
+  "epics": {
+    "ca_addr_list": {
+      "type":        "string",
+      "label":       "CA address list",
+      "description": "Space-separated list of CA gateway / broadcast addresses (blank = auto)",
+      "default":     ""
+    },
+    "ca_auto_addr": {
+      "type":        "bool",
+      "label":       "CA auto-address",
+      "description": "Let libca determine the address list automatically",
+      "default":     true
+    },
+    "ca_max_array_bytes": {
+      "type":        "int",
+      "label":       "CA max array bytes",
+      "unit":        "B",
+      "description": "Maximum waveform payload for Channel Access (EPICS_CA_MAX_ARRAY_BYTES)",
+      "default":     10000000,
+      "min":         65536,
+      "max":         1073741824,
+      "step":        1048576
+    },
+    "pva_provider": {
+      "type":        "choice",
+      "label":       "PVA provider",
+      "description": "p4p provider name passed to Context()",
+      "default":     "pva",
+      "choices":     ["pva", "ca"]
+    }
+  },
+
+  "data_acquisition": {
+    "default_output_dir": {
+      "type":        "string",
+      "label":       "Output directory",
+      "description": "Default directory for scan output files (~ expands to home)",
+      "default":     "~/data"
+    },
+    "default_prefix": {
+      "type":        "string",
+      "label":       "File prefix",
+      "description": "Default filename prefix for new scans",
+      "default":     "scan"
+    },
+    "auto_increment": {
+      "type":        "bool",
+      "label":       "Auto-increment scan number",
+      "description": "Automatically increment the scan counter after each run",
+      "default":     true
+    },
+    "default_format": {
+      "type":        "choice",
+      "label":       "Default file format",
+      "description": "File format selected by default in the DAQ tab",
+      "default":     "HDF5",
+      "choices":     ["HDF5", "CSV", "SPEC"]
+    }
+  },
+
+  "ui": {
+    "strip_chart_history_s": {
+      "type":        "int",
+      "label":       "Strip chart history",
+      "unit":        "s",
+      "description": "Number of seconds of data retained in each strip-chart trace buffer",
+      "default":     300,
+      "min":         10,
+      "max":         3600,
+      "step":        10,
+      "live":        "ui.strip_chart_history_s"
+    },
+    "strip_chart_update_ms": {
+      "type":        "int",
+      "label":       "Strip chart update interval",
+      "unit":        "ms",
+      "description": "Redraw period for strip-chart canvases",
+      "default":     1000,
+      "min":         100,
+      "max":         10000,
+      "step":        100,
+      "live":        "ui.strip_chart_update_ms"
+    },
+    "image_rate_limit_hz": {
+      "type":        "float",
+      "label":       "Image rate limit",
+      "unit":        "Hz",
+      "description": "Maximum frame delivery rate from the PVA bridge to the Qt GUI",
+      "default":     5.0,
+      "min":         0.5,
+      "max":         50.0,
+      "step":        0.5,
+      "decimals":    1,
+      "live":        "ui.image_rate_limit_hz"
+    },
+    "overlay_opacity_rest": {
+      "type":        "float",
+      "label":       "Overlay opacity (rest)",
+      "description": "Opacity of motor overlays when the mouse is not over their region",
+      "default":     0.35,
+      "min":         0.05,
+      "max":         1.0,
+      "step":        0.05,
+      "decimals":    2,
+      "live":        "ui.overlay_opacity_rest"
+    },
+    "overlay_opacity_hover": {
+      "type":        "float",
+      "label":       "Overlay opacity (hover)",
+      "description": "Opacity of motor overlays when the mouse is over their region",
+      "default":     1.0,
+      "min":         0.05,
+      "max":         1.0,
+      "step":        0.05,
+      "decimals":    2,
+      "live":        "ui.overlay_opacity_hover"
+    }
+  },
+
+  "blop": {
+    "max_iterations": {
+      "type":        "int",
+      "label":       "Max iterations",
+      "description": "Maximum number of Bayesian optimisation steps",
+      "default":     50,
+      "min":         1,
+      "max":         1000,
+      "step":        5
+    },
+    "init_samples": {
+      "type":        "int",
+      "label":       "Initial samples",
+      "description": "Number of random initialisation samples before the GP model is fitted",
+      "default":     8,
+      "min":         2,
+      "max":         256,
+      "step":        2
+    },
+    "random_seed": {
+      "type":        "int",
+      "label":       "Random seed",
+      "description": "RNG seed for reproducible optimisation runs (0 = unseeded)",
+      "default":     42,
+      "min":         0,
+      "max":         2147483647,
+      "step":        1
+    },
+    "verbose": {
+      "type":        "bool",
+      "label":       "Verbose logging",
+      "description": "Print blop progress messages to stdout",
+      "default":     true
+    }
+  }
+}

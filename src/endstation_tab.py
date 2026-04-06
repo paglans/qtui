@@ -777,6 +777,65 @@ class EndstationTab(QWidget):
         self._y_combo.currentTextChanged.connect(self._on_axis)
         self._on_axis()
 
+    def apply_config(self, key: str, value):
+        """
+        Slot wired to ConfigurationTab.config_changed(key, value).
+        Handles ui.* keys that affect the endstation tab.
+        """
+        if key == "ui.image_rate_limit_hz":
+            hz = max(0.5, float(value))
+            # _PVABridge stores the minimum inter-frame interval in ms
+            new_interval_ms = int(1000.0 / hz)
+            bridge = getattr(self._viewer, "_bridge", None)
+            if bridge is not None:
+                bridge.MIN_INTERVAL_MS = new_interval_ms
+
+        elif key == "ui.overlay_opacity_rest":
+            opacity = max(0.05, min(1.0, float(value)))
+            self._set_overlay_opacity_rest(opacity)
+
+        elif key == "ui.overlay_opacity_hover":
+            opacity = max(0.05, min(1.0, float(value)))
+            self._set_overlay_opacity_hover(opacity)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _set_overlay_opacity_rest(self, opacity: float):
+        """
+        Update the at-rest opacity for every _PVOverlayWidget.
+        The overlays store their rest opacity in _opacity_rest; calling
+        _apply_opacity() re-applies it immediately if the region is not
+        currently hovered.
+        """
+        for overlay in self._overlays():
+            overlay._opacity_rest = opacity
+            # Only update immediately if the overlay is not currently hovered
+            if not getattr(overlay, "_hovered", False):
+                effect = overlay.graphicsEffect()
+                if effect is not None:
+                    effect.setOpacity(opacity)
+
+    def _set_overlay_opacity_hover(self, opacity: float):
+        """Update the hover opacity and apply it to any overlay currently hovered."""
+        for overlay in self._overlays():
+            overlay._opacity_hover = opacity
+            if getattr(overlay, "_hovered", False):
+                effect = overlay.graphicsEffect()
+                if effect is not None:
+                    effect.setOpacity(opacity)
+
+    def _overlays(self):
+        """
+        Return all _PVOverlayWidget instances.
+        Adjust the attribute name / collection to match your implementation.
+        Typical patterns:
+            return list(self._overlay_widgets.values())   # if stored in a dict
+            return self._motor_overlays                    # if stored in a list
+        """
+        # ── adapt this line to your actual overlay storage ─────────────────
+        return list(getattr(self, "_overlay_widgets", {}).values())
+
+
     def _on_axis(self):
         xn=self._x_combo.currentText(); yn=self._y_combo.currentText()
         self._chart.set_x_pv(self._motor_pvs.get(xn,""))

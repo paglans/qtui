@@ -13,7 +13,6 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--no-sandbox --disable-dev-shm-usage"
 )
 
-    
 import sys
 from pathlib import Path
 
@@ -26,6 +25,7 @@ from beamline_tab import BeamlineTab
 from endstation_tab import EndstationTab
 from daq_tab import DAQTab
 from blop_tab import BLOPTab
+from configuration_tab import ConfigurationTab
 
 
 class MainWindow(QMainWindow):
@@ -67,13 +67,38 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover { background:#1e2a4e; color:#e0e0e0; }
         """)
 
+        # ── Instantiate all tabs (assign to locals so signals can be wired) ───
+        beamline_tab   = BeamlineTab(amber_cfg, all_signals, all_pvs)
         endstation_tab = EndstationTab(hirrixs_cfg, amber_cfg, all_pvs, all_signals)
         daq_tab        = DAQTab(amber_cfg, hirrixs_cfg)
         blop_tab       = BLOPTab(amber_cfg, hirrixs_cfg)
-        tabs.addTab(BeamlineTab(amber_cfg, all_signals, all_pvs), "🔬  AMBER Beamline")
-        tabs.addTab(endstation_tab,                               "⚗️  HiRRIXS Endstation")
-        tabs.addTab(daq_tab,                                      "💾  Data Acquisition")
-        tabs.addTab(blop_tab,                                     "🤖  BLOP")
+        config_tab     = ConfigurationTab()
+
+        tabs.addTab(beamline_tab,   "🔬  AMBER Beamline")
+        tabs.addTab(endstation_tab, "⚗️  HiRRIXS Endstation")
+        tabs.addTab(daq_tab,        "💾  Data Acquisition")
+        tabs.addTab(blop_tab,       "🤖  BLOP")
+        tabs.addTab(config_tab,     "⚙️  Configuration")
+
+        # ── Wire live config updates ──────────────────────────────────────────
+        config_tab.config_changed.connect(beamline_tab.apply_config)
+        config_tab.config_changed.connect(endstation_tab.apply_config)
+        # config_tab.config_changed.connect(daq_tab.apply_config)
+        # config_tab.config_changed.connect(blop_tab.apply_config)
+
+        # ── Apply stored config values at startup ─────────────────────────────
+        for key in [
+            "ui.strip_chart_history_s",
+            "ui.strip_chart_update_ms",
+            "ui.image_rate_limit_hz",
+            "ui.overlay_opacity_rest",
+            "ui.overlay_opacity_hover",
+        ]:
+            value = config_tab.get(key)
+            if value is not None:
+                beamline_tab.apply_config(key, value)
+                endstation_tab.apply_config(key, value)
+
         self.setCentralWidget(tabs)
 
         def _on_tab_changed(idx):
@@ -100,18 +125,8 @@ def main():
     try:
         import epics
         epics.ca.initialize_libca()
-        # Diagnostic: test monitor callback directly
-        #def _test_cb(pvname=None, value=None, **kw):
-        #    print(f"[DIAG] monitor callback fired: {pvname} = {value}")
-        #pv = epics.PV('BL6013:MirrorAngle',
-        #              callback=_test_cb,
-        #              auto_monitor=True,
-        #              connection_timeout=0.001)
-        #print(f"[DIAG] PV created, connected={pv.connected}, value={pv.value}")
-    #except Exception as e:
     except Exception:
         pass
-        #print(f"[DIAG] epics error: {e}")
 
     win = MainWindow()
     win.show()

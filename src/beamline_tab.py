@@ -137,6 +137,7 @@ class StripChart(QWidget):
         super().__init__(parent)
         self._pv_map = pv_map
         self._traces: dict = {}
+        self._dirty  = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(4,4,4,4); root.setSpacing(4)
@@ -176,6 +177,25 @@ class StripChart(QWidget):
 
         PVMonitor().value_changed.connect(self._on_pv)
 
+        # Coalescing redraw timer — redraws at configured rate, not on every PV update
+        self._redraw_timer = QTimer(self)
+        self._redraw_timer.setInterval(1000)          # default 1 s, matches config default
+        self._redraw_timer.timeout.connect(self._redraw)
+        self._redraw_timer.start()
+        self._dirty = False                           # flag set by _on_pv
+
+    # ── live-config hooks ──────────────────────────────────────────────────────
+    def set_update_interval(self, ms: int):
+        self._redraw_timer.setInterval(max(100, int(ms)))
+
+    def set_history_length(self, seconds: int):
+        """Resize all trace deques; existing data that still fits is preserved."""
+        new_maxlen = max(10, int(seconds))
+        for info in self._traces.values():
+            info['times']  = deque(info['times'],  maxlen=new_maxlen)
+            info['values'] = deque(info['values'], maxlen=new_maxlen)
+
+    # ── internal ───────────────────────────────────────────────────────────────
     def _style_ax(self):
         ax = self._ax; ax.set_facecolor(PAL["bg"])
         for sp in ax.spines.values(): sp.set_color("#2a3a5e")
@@ -232,7 +252,20 @@ class StripChart(QWidget):
         hl.addWidget(rm)
         self._legend_layout.addWidget(row)
 
+    def _on_pv(self, name, value):
+        if value is None: return
+        try: fv = float(value)
+        except: return
+        now = datetime.now()
+        for t in self._traces.values():
+            if t["pv"] == name:
+                t["times"].append(now); t["values"].append(fv)
+                if MPL_AVAILABLE and t["line"]:
+                    t["line"].set_data(list(t["times"]), list(t["values"]))
+                self._dirty = True
+
     def _redraw(self):
+        if not self._dirty: return
         if not MPL_AVAILABLE or not self._traces: return
         all_y = [v for t in self._traces.values() for v in t["values"]]
         all_x = [v for t in self._traces.values() for v in t["times"]]
@@ -247,25 +280,14 @@ class StripChart(QWidget):
         self._ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S"))
         self._fig.autofmt_xdate(rotation=30, ha="right")
         self._canvas.draw_idle()
-
-    def _on_pv(self, name, value):
-        if value is None: return
-        try: fv = float(value)
-        except: return
-        now = datetime.now(); matched = False
-        for t in self._traces.values():
-            if t["pv"] == name:
-                t["times"].append(now); t["values"].append(fv)
-                if MPL_AVAILABLE and t["line"]:
-                    t["line"].set_data(list(t["times"]), list(t["values"]))
-                matched = True
-        if matched: self._redraw()
+        self._dirty = False
 
     def _clear_all(self):
         for t in self._traces.values():
             t["times"].clear(); t["values"].clear()
             if MPL_AVAILABLE and t["line"]: t["line"].set_data([], [])
         if MPL_AVAILABLE: self._canvas.draw_idle()
+        self._dirty = False
 
 # ── Scan Window ───────────────────────────────────────────────────────────────
 SCAN_DWELL_MS = 300
@@ -755,8 +777,10 @@ class BeamlineTab(QWidget):
             hsplit.addWidget(ph)
 
         chart_split = QSplitter(Qt.Vertical); chart_split.setStyleSheet(SPLITTER_STYLE)
-        chart_split.addWidget(StripChart(all_pvs, "Strip Chart 1"))
-        chart_split.addWidget(StripChart(all_pvs, "Strip Chart 2"))
+        self._strip1 = StripChart(all_pvs, "Strip Chart 1")
+        self._strip2 = StripChart(all_pvs, "Strip Chart 2")
+        chart_split.addWidget(self._strip1)
+        chart_split.addWidget(self._strip2)
         chart_split.setSizes([1,1])
         hsplit.addWidget(chart_split)
         hsplit.setSizes([600, 400])
@@ -764,6 +788,36 @@ class BeamlineTab(QWidget):
         vsplit.addWidget(hsplit)
         vsplit.setSizes([200, 700])
         outer.addWidget(vsplit, 1)
+
+    def apply_config(self, key: str, value):
+        """
+        Slot wired to ConfigurationTab.config_changed(key, value).
+        Handles every 'ui.*' key that affects the beamline tab.
+
+        Parameters
+        ----------
+        key   : dotted config path, e.g. "ui.strip_chart_update_ms"
+        value : new Python value (already coerced to the correct type)
+        """
+        if key == "ui.strip_chart_update_ms":
+            ms = max(100, int(value))
+            for sc in self._strip_charts():
+                sc.set_update_interval(ms)
+
+        elif key == "ui.strip_chart_history_s":
+            secs = max(10, int(value))
+            for sc in self._strip_charts():
+                sc.set_history_length(secs)
+
+    def _strip_charts(self):
+        """Return all StripChart instances owned by this tab."""
+        # Adjust attribute names to match your actual implementation:
+        charts = []
+        for attr in ("_strip1", "_strip2"):
+            sc = getattr(self, attr, None)
+            if sc is not None:
+                charts.append(sc)
+        return charts
 
     def _open_scan(self, comp_name, motor_pvs):
         dlg = ScanWindow(comp_name, motor_pvs, self._all_signals, self)

@@ -203,13 +203,19 @@ class ScanPlot(QWidget):
 class ScanFileWriter:
     """Writes 1-D scan data to HDF5, CSV, or SPEC (.dat) files.
 
+    Column layout in every format
+    ──────────────────────────────
+      col 0          : scan motor  (x axis)
+      col 1          : selected detector  (y axis / plotted signal)
+      cols 2 .. N    : all remaining signals then all remaining motors
+                       (alphabetical within each group, scan motor excluded)
+
     Lifecycle
-    ---------
-    writer = ScanFileWriter()
-    writer.open(path, meta)     # scan start  → writes file header
-    writer.write_point(x, y)   # each step   → flushes immediately
-    writer.close()              # scan end    → finalises and closes
-    writer.close(aborted=True)  # on abort    → marks partial and closes
+    ─────────
+      writer.open(path, meta, columns)   # scan start
+      writer.write_point(x, y, extras)   # each step  – flushes immediately
+      writer.close()                     # normal finish
+      writer.close(aborted=True)         # abort
     """
 
     FMT_HDF5 = 0
@@ -219,34 +225,35 @@ class ScanFileWriter:
     def __init__(self):
         self._fmt      = None
         self._path     = None
-        self._meta: dict = {}
+        self._meta: dict   = {}
+        self._columns: list = []   # ordered column names (excl. scan motor)
+        # per-column buffers (HDF5 writes arrays at close)
         self._xs: list = []
-        self._ys: list = []
-        # format-specific handles
-        self._h5file   = None
-        self._csvfile  = None
+        self._data: dict = {}      # name → list[float]
+        # file handles
+        self._h5file    = None
+        self._csvfile   = None
         self._csvwriter = None
-        self._specfile = None
+        self._specfile  = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def open(self, path: str, meta: dict) -> bool:
+    def open(self, path: str, meta: dict, columns: list) -> bool:
         """Open file and write header.
 
         Parameters
         ----------
-        path : str
-            Full output path (extension determines format).
-        meta : dict
-            Keys used: motor, detector, start, stop, steps,
-                       exposure, scan_num.
-
-        Returns True on success.
+        path    : full output path; extension selects format.
+        meta    : scan metadata (motor, detector, start, stop, steps,
+                  exposure, scan_num, prefix).
+        columns : ordered list of extra channel names written after the
+                  scan-motor column.  The selected detector must be first.
         """
-        self._path = path
-        self._meta = meta
-        self._xs   = []
-        self._ys   = []
+        self._path    = path
+        self._meta    = meta
+        self._columns = list(columns)
+        self._xs      = []
+        self._data    = {c: [] for c in self._columns}
         ext = Path(path).suffix.lower()
         self._fmt = {".h5": self.FMT_HDF5,
                      ".csv": self.FMT_CSV,
@@ -259,23 +266,36 @@ class ScanFileWriter:
             print(f"[ScanFileWriter] open error: {exc}")
             return False
 
-    def write_point(self, x: float, y: float):
-        """Append one (x, y) point and flush to disk."""
+    def write_point(self, x: float, y: float, extras: dict):
+        """Append one row.
+
+        Parameters
+        ----------
+        x      : scan-motor position
+        y      : selected-detector reading (must equal extras[columns[0]])
+        extras : {channel_name: float} for every channel in self._columns.
+                 Missing channels are stored as NaN.
+        """
         self._xs.append(x)
-        self._ys.append(y)
+        row = []
+        for c in self._columns:
+            v = extras.get(c, float("nan"))
+            self._data[c].append(v)
+            row.append(v)
         try:
             if self._fmt == self.FMT_CSV and self._csvwriter:
-                self._csvwriter.writerow([f"{x:.6g}", f"{y:.6g}"])
+                self._csvwriter.writerow(
+                    [f"{x:.6g}"] + [_fmt_val(v) for v in row])
                 self._csvfile.flush()
             elif self._fmt == self.FMT_SPEC and self._specfile:
-                self._specfile.write(f"  {x:.6g}  {y:.6g}\n")
+                vals = "  ".join([f"{x:.6g}"] + [_fmt_val(v) for v in row])
+                self._specfile.write(f"  {vals}\n")
                 self._specfile.flush()
-            # HDF5: buffer in-memory; written as contiguous arrays on close
+            # HDF5: buffered; written as arrays at close()
         except Exception as exc:
             print(f"[ScanFileWriter] write_point error: {exc}")
 
     def close(self, aborted: bool = False):
-        """Finalise and close the file."""
         try:
             if   self._fmt == self.FMT_HDF5: self._close_hdf5(aborted)
             elif self._fmt == self.FMT_CSV:  self._close_csv(aborted)
@@ -296,6 +316,8 @@ class ScanFileWriter:
         meta.attrs["timestamp"]   = datetime.now().isoformat()
         meta.attrs["file_format"] = "AMBER_HiRRIXS_HDF5_v1"
         meta.attrs["beamline"]    = "ALS BL601 AMBER"
+        meta.attrs["columns"]     = [self._meta.get("motor", "motor")]  \
+                                    + self._columns
         return True
 
     def _close_hdf5(self, aborted: bool):
@@ -303,14 +325,16 @@ class ScanFileWriter:
             return
         grp  = self._h5file["scan"]
         data = grp.create_group("data")
-        xs   = np.array(self._xs, dtype=np.float64)
-        ys   = np.array(self._ys, dtype=np.float64)
         motor_name = self._meta.get("motor", "motor")
-        det_name   = self._meta.get("detector", "detector")
-        ds_x = data.create_dataset(motor_name, data=xs)
-        ds_y = data.create_dataset(det_name,   data=ys)
-        ds_x.attrs["units"] = "user"
-        ds_y.attrs["units"] = "counts"
+        xs = np.array(self._xs, dtype=np.float64)
+        ds = data.create_dataset(motor_name, data=xs)
+        ds.attrs["role"]  = "scan_motor"
+        ds.attrs["units"] = "user"
+        for i, col in enumerate(self._columns):
+            arr  = np.array(self._data[col], dtype=np.float64)
+            ds_c = data.create_dataset(col, data=arr)
+            ds_c.attrs["role"]  = "detector" if i == 0 else "channel"
+            ds_c.attrs["units"] = "counts"
         grp.attrs["n_points"] = len(xs)
         grp.attrs["aborted"]  = aborted
         self._h5file.close()
@@ -319,24 +343,26 @@ class ScanFileWriter:
     # ── CSV ───────────────────────────────────────────────────────────────────
 
     def _open_csv(self) -> bool:
-        m = self._meta
+        m   = self._meta
+        now = datetime.now()
         self._csvfile = open(self._path, "w", newline="")
-        # Comment block
         for line in [
             f"# AMBER HiRRIXS scan — {Path(self._path).stem}",
-            f"# Date:     {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Date:     {now.strftime('%Y-%m-%d %H:%M:%S')}",
             f"# Beamline: ALS BL601 AMBER",
             f"# Motor:    {m.get('motor','?')}",
-            f"# Detector: {m.get('detector','?')}",
+            f"# Detector: {m.get('detector','?')}  (plotted column)",
             f"# Range:    {m.get('start','?')} → {m.get('stop','?')}  "
             f"({m.get('steps','?')} steps)",
             f"# Exposure: {m.get('exposure','?')} s",
             f"# Scan #:   {m.get('scan_num','?')}",
+            f"# Columns:  {m.get('motor','motor')}, "
+            + ", ".join(self._columns),
         ]:
             self._csvfile.write(line + "\n")
         self._csvwriter = csv.writer(self._csvfile)
-        self._csvwriter.writerow([m.get("motor", "motor"),
-                                  m.get("detector", "detector")])
+        self._csvwriter.writerow(
+            [m.get("motor", "motor")] + self._columns)
         self._csvfile.flush()
         return True
 
@@ -353,7 +379,6 @@ class ScanFileWriter:
     # ── SPEC (.dat) ───────────────────────────────────────────────────────────
 
     def _open_spec(self) -> bool:
-        """Writes a SPEC-compatible file header (standard synchrotron format)."""
         m   = self._meta
         now = datetime.now()
         motor    = m.get("motor",    "motor")
@@ -363,23 +388,23 @@ class ScanFileWriter:
         steps    = m.get("steps",    1)
         exposure = m.get("exposure", 1.0)
         scan_num = m.get("scan_num", 1)
+        n_cols   = 1 + len(self._columns)   # motor + all channels
 
         self._specfile = open(self._path, "w")
         f = self._specfile
-        # File-level header
         f.write(f"#F {Path(self._path).name}\n")
         f.write(f"#E {int(now.timestamp())}\n")
         f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
         f.write(f"#C AMBER HiRRIXS  ALS BL601  "
                 f"User={m.get('prefix','scan')}\n")
         f.write("\n")
-        # Scan header
         f.write(f"#S {scan_num} ascan {motor} {start} {stop} "
                 f"{steps - 1} {exposure}\n")
         f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
         f.write(f"#T {exposure}  (Seconds)\n")
-        f.write(f"#N 2\n")
-        f.write(f"#L {motor}  {det}\n")
+        f.write(f"#C Plotted detector: {det}\n")
+        f.write(f"#N {n_cols}\n")
+        f.write(f"#L {motor}  " + "  ".join(self._columns) + "\n")
         f.flush()
         return True
 
@@ -389,9 +414,14 @@ class ScanFileWriter:
         if aborted:
             self._specfile.write(
                 f"#C Scan aborted after {len(self._xs)} points\n")
-        self._specfile.write("\n")      # blank line terminates scan block
+        self._specfile.write("\n")
         self._specfile.close()
         self._specfile = None
+
+
+def _fmt_val(v: float) -> str:
+    """Format a channel value; NaN → 'nan' (keeps columns aligned)."""
+    return "nan" if (v != v) else f"{v:.6g}"
 
 
 # ── DAQ Tab ───────────────────────────────────────────────────────────────────
@@ -403,6 +433,7 @@ class DAQTab(QWidget):
         self.setStyleSheet(f"background:{PAL['bg']};")
         self._state = _ScanState.IDLE
         self._writer: ScanFileWriter | None = None
+        self._scan_columns: list = []   # ordered extra channel names
         self._scan_idx = 0; self._scan_positions: list = []
         self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
 
@@ -658,7 +689,7 @@ class DAQTab(QWidget):
             f"color:{colors.get(state, PAL['text'])}; font-family:monospace; font-size:8pt;")
 
     # ── Scan engine ───────────────────────────────────────────────────────────
-    def _start_scan(self):
+    def _start_scan(self):                          # REPLACE existing method
         if self._state == _ScanState.RUNNING:
             return
         n     = self._p_steps.value()
@@ -666,11 +697,23 @@ class DAQTab(QWidget):
         stop  = self._p_stop.value()
         step  = (stop - start) / max(n - 1, 1)
         self._scan_positions = [start + i * step for i in range(n)]
-        self._scan_idx  = 0
-        self._scan_t0   = time.monotonic()
+        self._scan_idx = 0
+        self._scan_t0  = time.monotonic()
         fname  = self._current_filename()
         motor  = self._motor_combo.currentText()
         det    = self._det_combo.currentText()
+
+        # ── Build ordered column list ─────────────────────────────────────────
+        # Layout: [selected_detector, ...other signals α, ...other motors α]
+        other_signals = sorted(
+            k for k in self._signal_pvs if k != det)
+        other_motors  = sorted(
+            k for k in self._motor_pvs  if k != motor and k != det)
+        self._scan_columns = (
+            [det]
+            + [k for k in other_signals if k not in (det,)]
+            + [k for k in other_motors  if k not in (det,)]
+        )
 
         # ── Open file writer ──────────────────────────────────────────────────
         meta = dict(
@@ -684,8 +727,8 @@ class DAQTab(QWidget):
             prefix   = self._prefix_edit.text().strip() or "scan",
         )
         self._writer = ScanFileWriter()
-        if not self._writer.open(fname, meta):
-            self._writer = None          # scan continues; data just not saved
+        if not self._writer.open(fname, meta, self._scan_columns):
+            self._writer = None
             self._log_msg(f"⚠ Cannot open output file: {fname}", PAL["nc"])
             from PySide6.QtWidgets import QMessageBox
             dlg = QMessageBox(self)
@@ -702,7 +745,8 @@ class DAQTab(QWidget):
             )
             dlg.setStandardButtons(QMessageBox.Abort | QMessageBox.Ignore)
             dlg.setDefaultButton(QMessageBox.Abort)
-            dlg.setStyleSheet(f"background:{PAL['surface']}; color:{PAL['text']};")
+            dlg.setStyleSheet(
+                f"background:{PAL['surface']}; color:{PAL['text']};")
             if dlg.exec() == QMessageBox.Abort:
                 self._set_state(_ScanState.IDLE)
                 self._reset_run_btns()
@@ -714,10 +758,11 @@ class DAQTab(QWidget):
         self._st_file.setText(Path(fname).name)
         self._st_file.setStyleSheet(
             f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
+        n_extra = len(self._scan_columns) - 1
         self._log_msg(f"▶ Scan started  →  {fname}", PAL["ok"])
         self._log_msg(
             f"   Motor: {motor}  |  Det: {det}  |  {n} points  "
-            f"[{start:.4g} → {stop:.4g}]")
+            f"[{start:.4g} → {stop:.4g}]  |  +{n_extra} extra channels")
         self._set_state(_ScanState.RUNNING)
         self._run_btn.setEnabled(False)
         self._pause_btn.setEnabled(True)
@@ -736,20 +781,17 @@ class DAQTab(QWidget):
             self._log_msg("▶ Scan resumed.", PAL["ok"])
             self._scan_timer.start(SCAN_DWELL_MS)
 
-    def _abort_scan(self):
+    def _abort_scan(self):                          # REPLACE existing method
         self._scan_timer.stop()
         self._set_state(_ScanState.ABORTING)
-
-        # ── Finalise (partial) file ───────────────────────────────────────────
         if self._writer is not None:
             self._writer.close(aborted=True)
             self._writer = None
-
         self._log_msg("■ Scan aborted.", PAL["nc"])
         self._scan_plot.finish("Scan aborted")
         self._reset_run_btns()
 
-    def _scan_step(self):
+    def _scan_step(self):                           # REPLACE existing method
         if self._state != _ScanState.RUNNING:
             self._scan_timer.stop()
             return
@@ -757,13 +799,15 @@ class DAQTab(QWidget):
             self._finish_scan()
             return
 
-        x  = self._scan_positions[self._scan_idx]
-        pv = self._motor_pvs.get(self._motor_combo.currentText(), "")
+        x     = self._scan_positions[self._scan_idx]
+        motor = self._motor_combo.currentText()
+        det   = self._det_combo.currentText()
+        pv    = self._motor_pvs.get(motor, "")
         if pv:
             PVMonitor().put(pv, x)
 
-        sig_pv = ({**self._signal_pvs, **self._det_pvs}
-                  .get(self._det_combo.currentText(), ""))
+        # ── Read selected detector (plotted) ──────────────────────────────────
+        sig_pv = ({**self._signal_pvs, **self._det_pvs}).get(det, "")
         if EPICS_AVAILABLE and sig_pv:
             raw = PVMonitor().get(sig_pv)
             y   = float(raw) if raw is not None else float("nan")
@@ -775,9 +819,24 @@ class DAQTab(QWidget):
 
         self._scan_plot.add_point(x, y)
 
-        # ── Write point to file ───────────────────────────────────────────────
+        # ── Read all extra channels ───────────────────────────────────────────
+        extras: dict = {det: y}
+        all_readable = {**self._signal_pvs,
+                        **self._det_pvs,
+                        **self._motor_pvs}
+        for col in self._scan_columns:
+            if col == det:
+                continue
+            cpv = all_readable.get(col, "")
+            if EPICS_AVAILABLE and cpv:
+                raw = PVMonitor().get(cpv)
+                extras[col] = float(raw) if raw is not None else float("nan")
+            else:
+                extras[col] = float("nan")
+
+        # ── Write row to file ─────────────────────────────────────────────────
         if self._writer is not None:
-            self._writer.write_point(x, y)
+            self._writer.write_point(x, y, extras)
 
         self._scan_idx += 1
         self._progress.setValue(self._scan_idx)
@@ -789,15 +848,12 @@ class DAQTab(QWidget):
         if self._scan_idx >= len(self._scan_positions):
             self._finish_scan()
 
-    def _finish_scan(self):
+    def _finish_scan(self):                         # REPLACE existing method
         self._scan_timer.stop()
         fname = self._current_filename()
-
-        # ── Finalise file ─────────────────────────────────────────────────────
         if self._writer is not None:
             self._writer.close(aborted=False)
             self._writer = None
-
         self._scan_plot.finish(f"Scan complete — {Path(fname).name}")
         self._log_msg(f"✔ Scan complete.  File: {fname}", PAL["ok"])
         if self._auto_inc.isChecked():
