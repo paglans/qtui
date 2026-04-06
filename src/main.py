@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AMBER / HiRRIXS Control GUI")
-        self.resize(1600, 1100)
+        self.resize(2000, 1100)
         self._apply_palette()
 
         base = Path(__file__).parent.parent / "config"
@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         # ── Wire live config updates ──────────────────────────────────────────
         config_tab.config_changed.connect(beamline_tab.apply_config)
         config_tab.config_changed.connect(endstation_tab.apply_config)
+        config_tab.config_changed.connect(self._apply_epics_config)
         # config_tab.config_changed.connect(daq_tab.apply_config)
         # config_tab.config_changed.connect(blop_tab.apply_config)
 
@@ -99,12 +100,50 @@ class MainWindow(QMainWindow):
                 beamline_tab.apply_config(key, value)
                 endstation_tab.apply_config(key, value)
 
+        # ── Apply EPICS env vars from stored config at startup ────────────────
+        for key in [
+            "epics.ca_addr_list", "epics.ca_auto_addr",
+            "epics.pva_addr_list", "epics.pva_auto_addr",
+            "epics.ca_max_array_bytes",
+        ]:
+            value = config_tab.get(key)
+            if value is not None:
+                self._apply_epics_config(key, value)
+
         self.setCentralWidget(tabs)
 
         def _on_tab_changed(idx):
             if idx == 1:
                 endstation_tab._viewer.initialize()
         tabs.currentChanged.connect(_on_tab_changed)
+
+    # ── EPICS environment variable handler ────────────────────────────────────
+    def _apply_epics_config(self, key: str, value):
+        """
+        Push epics.* config values into os.environ so that both pyepics (CA)
+        and p4p (PVA) pick them up.  Must be called before CA/PVA contexts
+        are created; at runtime a warning is printed because libca is already
+        initialised — a full restart is required for CA changes to take effect.
+        """
+        _MAP = {
+            "epics.ca_addr_list":       "EPICS_CA_ADDR_LIST",
+            "epics.ca_auto_addr":       "EPICS_CA_AUTO_ADDR_LIST",
+            "epics.pva_addr_list":      "EPICS_PVA_ADDR_LIST",
+            "epics.pva_auto_addr":      "EPICS_PVA_AUTO_ADDR_LIST",
+            "epics.ca_max_array_bytes": "EPICS_CA_MAX_ARRAY_BYTES",
+        }
+        env_key = _MAP.get(key)
+        if env_key is None:
+            return
+
+        # Booleans → "YES" / "NO" as EPICS expects
+        if isinstance(value, bool):
+            env_val = "YES" if value else "NO"
+        else:
+            env_val = str(value)
+
+        os.environ[env_key] = env_val
+        print(f"[config] {env_key}={env_val}")
 
     def _apply_palette(self):
         pal = QPalette()

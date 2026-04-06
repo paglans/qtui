@@ -11,6 +11,7 @@
     "step":        "Spin-box step size (int/float only)",
     "decimals":    "Decimal places shown (float only)",
     "choices":     "Allowed values (choice type only)",
+    "env_var":     "Environment variable this field reads from / writes to (display only)",
     "live":        "Dotted key emitted via config_changed on save (omit if no live effect)"
   },
 
@@ -45,24 +46,46 @@
     "ca_addr_list": {
       "type":        "string",
       "label":       "CA address list",
-      "description": "Space-separated list of CA gateway / broadcast addresses (blank = auto)",
-      "default":     ""
+      "env_var":     "EPICS_CA_ADDR_LIST",
+      "description": "Space-separated CA gateway / broadcast addresses (maps to EPICS_CA_ADDR_LIST)",
+      "default":     "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+      "live":        "epics.ca_addr_list"
     },
     "ca_auto_addr": {
       "type":        "bool",
       "label":       "CA auto-address",
-      "description": "Let libca determine the address list automatically",
-      "default":     true
+      "env_var":     "EPICS_CA_AUTO_ADDR_LIST",
+      "description": "Let libca determine the address list automatically (maps to EPICS_CA_AUTO_ADDR_LIST)",
+      "default":     false,
+      "live":        "epics.ca_auto_addr"
+    },
+    "pva_addr_list": {
+      "type":        "string",
+      "label":       "PVA address list",
+      "env_var":     "EPICS_PVA_ADDR_LIST",
+      "description": "Space-separated PVA gateway / broadcast addresses (maps to EPICS_PVA_ADDR_LIST)",
+      "default":     "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+      "live":        "epics.pva_addr_list"
+    },
+    "pva_auto_addr": {
+      "type":        "bool",
+      "label":       "PVA auto-address",
+      "env_var":     "EPICS_PVA_AUTO_ADDR_LIST",
+      "description": "Let p4p determine the address list automatically (maps to EPICS_PVA_AUTO_ADDR_LIST)",
+      "default":     false,
+      "live":        "epics.pva_auto_addr"
     },
     "ca_max_array_bytes": {
       "type":        "int",
       "label":       "CA max array bytes",
       "unit":        "B",
-      "description": "Maximum waveform payload for Channel Access (EPICS_CA_MAX_ARRAY_BYTES)",
+      "env_var":     "EPICS_CA_MAX_ARRAY_BYTES",
+      "description": "Maximum waveform payload for Channel Access (maps to EPICS_CA_MAX_ARRAY_BYTES)",
       "default":     10000000,
       "min":         65536,
       "max":         1073741824,
-      "step":        1048576
+      "step":        1048576,
+      "live":        "epics.ca_max_array_bytes"
     },
     "pva_provider": {
       "type":        "choice",

@@ -6,8 +6,10 @@
     "operator_email": "operator@lbl.gov"
   },
   "epics": {
-    "ca_addr_list":       "",
-    "ca_auto_addr":       true,
+    "ca_addr_list":       "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+    "ca_auto_addr":       false,
+    "pva_addr_list":      "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+    "pva_auto_addr":      false,
     "ca_max_array_bytes": 10000000,
     "pva_provider":       "pva"
   },
@@ -16,11 +18,6 @@
     "default_prefix":     "scan",
     "auto_increment":     true,
     "default_format":     "HDF5"
-  },
-  "tiled": {
-  	"serverAdress": "127.0.0.1",
-  	"port": "8000",
-  	"api_key": "KEYKEY"
   },
   "ui": {
     "strip_chart_history_s":  300,
