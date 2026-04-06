@@ -1,35 +1,36 @@
 {
   "general": {
-    "facility":       "ALS",
-    "beamline":       "BL601",
-    "endstation":     "HiRRIXS",
+    "facility": "ALS",
+    "beamline": "BL601",
+    "endstation": "HiRRIXS",
     "operator_email": "operator@lbl.gov"
   },
   "epics": {
-    "ca_addr_list":       "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
-    "ca_auto_addr":       false,
-    "pva_addr_list":      "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
-    "pva_auto_addr":      false,
+    "ca_addr_list": "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+    "ca_auto_addr": false,
+    "pva_addr_list": "cagw-bldmz.als.lbl.gov 192.168.10.2 192.168.10.3",
+    "pva_auto_addr": false,
     "ca_max_array_bytes": 10000000,
-    "pva_provider":       "pva"
+    "pva_provider": "pva"
   },
   "data_acquisition": {
     "default_output_dir": "~/data",
-    "default_prefix":     "scan",
-    "auto_increment":     true,
-    "default_format":     "HDF5"
+    "default_prefix": "scan",
+    "filename_mode": "timestamp",
+    "auto_increment": true,
+    "default_format": "HDF5"
   },
   "ui": {
-    "strip_chart_history_s":  300,
-    "strip_chart_update_ms":  1000,
-    "image_rate_limit_hz":    5.0,
-    "overlay_opacity_rest":   0.35,
-    "overlay_opacity_hover":  1.0
+    "strip_chart_history_s": 300,
+    "strip_chart_update_ms": 1000,
+    "image_rate_limit_hz": 5.0,
+    "overlay_opacity_rest": 0.35,
+    "overlay_opacity_hover": 1.0
   },
   "blop": {
     "max_iterations": 50,
-    "init_samples":   8,
-    "random_seed":    42,
-    "verbose":        true
+    "init_samples": 8,
+    "random_seed": 42,
+    "verbose": true
   }
 }

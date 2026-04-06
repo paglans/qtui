@@ -32,7 +32,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AMBER / HiRRIXS Control GUI")
-        self.resize(2000, 1100)
+        self.resize(1600, 1100)
         self._apply_palette()
 
         base = Path(__file__).parent.parent / "config"
@@ -70,9 +70,9 @@ class MainWindow(QMainWindow):
         # ── Instantiate all tabs (assign to locals so signals can be wired) ───
         beamline_tab   = BeamlineTab(amber_cfg, all_signals, all_pvs)
         endstation_tab = EndstationTab(hirrixs_cfg, amber_cfg, all_pvs, all_signals)
-        daq_tab        = DAQTab(amber_cfg, hirrixs_cfg)
-        blop_tab       = BLOPTab(amber_cfg, hirrixs_cfg)
         config_tab     = ConfigurationTab()
+        daq_tab        = DAQTab(amber_cfg, hirrixs_cfg, config_tab)
+        blop_tab       = BLOPTab(amber_cfg, hirrixs_cfg)
 
         tabs.addTab(beamline_tab,   "🔬  AMBER Beamline")
         tabs.addTab(endstation_tab, "⚗️  HiRRIXS Endstation")
@@ -83,8 +83,8 @@ class MainWindow(QMainWindow):
         # ── Wire live config updates ──────────────────────────────────────────
         config_tab.config_changed.connect(beamline_tab.apply_config)
         config_tab.config_changed.connect(endstation_tab.apply_config)
+        config_tab.config_changed.connect(daq_tab.apply_config)
         config_tab.config_changed.connect(self._apply_epics_config)
-        # config_tab.config_changed.connect(daq_tab.apply_config)
         # config_tab.config_changed.connect(blop_tab.apply_config)
 
         # ── Apply stored config values at startup ─────────────────────────────

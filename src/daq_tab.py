@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QLineEdit, QPushButton, QComboBox,
     QProgressBar, QScrollArea, QSizePolicy, QFrame, QCheckBox,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QTextEdit, QFileDialog,
+    QHeaderView, QTextEdit, QFileDialog, QRadioButton,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
@@ -428,7 +428,9 @@ def _fmt_val(v: float) -> str:
 SCAN_DWELL_MS = 200
 
 class DAQTab(QWidget):
-    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict, parent=None):
+    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict, config_tab=None, parent=None):
+        # Store for apply_config use
+        self._config_tab = config_tab
         super().__init__(parent)
         self.setStyleSheet(f"background:{PAL['bg']};")
         self._state = _ScanState.IDLE
@@ -470,6 +472,9 @@ class DAQTab(QWidget):
         scroll_left.setStyleSheet(f"background:{PAL['bg']}; border:none;")
         scroll_left.setWidget(left)
         hsplit.addWidget(scroll_left)
+
+        if config_tab is not None:
+            self._seed_from_config(config_tab)
 
         # ── Right panel ───────────────────────────────────────────────────────
         vsplit = QSplitter(Qt.Vertical); vsplit.setStyleSheet(SPLITTER_STYLE)
@@ -524,6 +529,54 @@ class DAQTab(QWidget):
                         out[f"{k}:{sk}"] = sv
         return out
 
+    def _seed_from_config(self, config_tab):
+        """Populate file-output widgets from configuration.json at startup."""
+        out_dir = config_tab.get("data_acquisition.default_output_dir")
+        if out_dir:
+            import os
+            self._dir_edit.setText(os.path.expanduser(out_dir))
+
+        prefix = config_tab.get("data_acquisition.default_prefix")
+        if prefix:
+            self._prefix_edit.setText(prefix)
+
+        mode = config_tab.get("data_acquisition.filename_mode")
+        if mode == "timestamp":
+            self._rb_ts.setChecked(True)
+        else:
+            self._rb_num.setChecked(True)
+
+        auto_inc = config_tab.get("data_acquisition.auto_increment")
+        if auto_inc is not None:
+            self._auto_inc.setChecked(bool(auto_inc))
+
+        fmt = config_tab.get("data_acquisition.default_format")
+        fmt_map = {"HDF5": 0, "CSV": 1, "SPEC": 2}
+        if fmt in fmt_map:
+            self._fmt_combo.setCurrentIndex(fmt_map[fmt])
+
+        self._update_fname_preview()
+
+    def apply_config(self, key: str, value):
+        """Slot wired to ConfigurationTab.config_changed — live updates."""
+        import os
+        if key == "data_acquisition.default_output_dir":
+            self._dir_edit.setText(os.path.expanduser(str(value)))
+        elif key == "data_acquisition.default_prefix":
+            self._prefix_edit.setText(str(value))
+        elif key == "data_acquisition.filename_mode":
+            if value == "timestamp":
+                self._rb_ts.setChecked(True)
+            else:
+                self._rb_num.setChecked(True)
+        elif key == "data_acquisition.auto_increment":
+            self._auto_inc.setChecked(bool(value))
+        elif key == "data_acquisition.default_format":
+            fmt_map = {"HDF5": 0, "CSV": 1, "SPEC": 2}
+            if value in fmt_map:
+                self._fmt_combo.setCurrentIndex(fmt_map[value])
+        self._update_fname_preview()
+        
     # ── UI builders ───────────────────────────────────────────────────────────
     def _build_file_group(self):
         grp = QGroupBox("File Output"); grp.setStyleSheet(GRP_STYLE)
@@ -544,20 +597,67 @@ class DAQTab(QWidget):
         self._prefix_edit = QLineEdit("scan")
         self._prefix_edit.setStyleSheet(INPUT_STYLE); gl.addWidget(self._prefix_edit, 1, 1, 1, 2)
 
-        gl.addWidget(ql("Scan number"), 2, 0)
-        self._scan_num = QSpinBox(); self._scan_num.setRange(1, 99999)
-        self._scan_num.setValue(1); self._scan_num.setStyleSheet(SPIN_STYLE)
-        gl.addWidget(self._scan_num, 2, 1, 1, 2)
-
-        gl.addWidget(ql("Format"), 3, 0)
+        gl.addWidget(ql("Format"), 2, 0)
         self._fmt_combo = QComboBox(); self._fmt_combo.setStyleSheet(COMBO_STYLE)
         for fmt in ("HDF5 (.h5)", "CSV (.csv)", "SPEC (.dat)"): self._fmt_combo.addItem(fmt)
-        gl.addWidget(self._fmt_combo, 3, 1, 1, 2)
+        gl.addWidget(self._fmt_combo, 2, 1, 1, 2)
+
+        # ── Numbering mode radio buttons ──────────────────────────────────────
+        gl.addWidget(ql("Numbering"), 3, 0)
+        mode_w = QWidget(); mode_w.setStyleSheet("background:transparent;")
+        mode_hl = QHBoxLayout(mode_w); mode_hl.setContentsMargins(0,0,0,0); mode_hl.setSpacing(12)
+        _rb_style = f"QRadioButton {{ color:{PAL['text']}; }} " \
+                    f"QRadioButton::indicator {{ width:13px; height:13px; " \
+                    f"border:1px solid #2a3a5e; border-radius:7px; background:{PAL['bg']}; }} " \
+                    f"QRadioButton::indicator:checked {{ background:{PAL['accent']}; " \
+                    f"border-color:{PAL['accent']}; }}"
+        self._rb_num  = QRadioButton("Scan number"); self._rb_num.setStyleSheet(_rb_style)
+        self._rb_ts   = QRadioButton("Timestamp (YYYYMMDDHHMMSS)"); self._rb_ts.setStyleSheet(_rb_style)
+        self._rb_num.setChecked(True)
+        mode_hl.addWidget(self._rb_num); mode_hl.addWidget(self._rb_ts); mode_hl.addStretch()
+        gl.addWidget(mode_w, 3, 1, 1, 2)
+
+        # ── Scan number row (only visible in number mode) ─────────────────────
+        self._scan_num_lbl = ql("Scan number")
+        gl.addWidget(self._scan_num_lbl, 4, 0)
+        self._scan_num = QSpinBox(); self._scan_num.setRange(1, 99999)
+        self._scan_num.setValue(1); self._scan_num.setStyleSheet(SPIN_STYLE)
+        gl.addWidget(self._scan_num, 4, 1, 1, 2)
 
         self._auto_inc = QCheckBox("Auto-increment scan number")
         self._auto_inc.setStyleSheet(CHECK_STYLE); self._auto_inc.setChecked(True)
-        gl.addWidget(self._auto_inc, 4, 0, 1, 3)
+        gl.addWidget(self._auto_inc, 5, 0, 1, 3)
+
+        # ── Preview label ─────────────────────────────────────────────────────
+        gl.addWidget(ql("Preview"), 6, 0)
+        self._fname_preview = QLabel("")
+        self._fname_preview.setStyleSheet(
+            f"color:{PAL['accent']}; font-family:monospace; font-size:8pt; background:transparent;")
+        self._fname_preview.setWordWrap(True)
+        gl.addWidget(self._fname_preview, 6, 1, 1, 2)
+
+        # Wire visibility and preview updates
+        self._rb_num.toggled.connect(self._on_numbering_mode_changed)
+        self._rb_num.toggled.connect(self._update_fname_preview)
+        self._rb_ts.toggled.connect(self._update_fname_preview)
+        self._prefix_edit.textChanged.connect(self._update_fname_preview)
+        self._scan_num.valueChanged.connect(self._update_fname_preview)
+        self._fmt_combo.currentIndexChanged.connect(self._update_fname_preview)
+        self._auto_inc.stateChanged.connect(self._update_fname_preview)
+
+        self._on_numbering_mode_changed(True)   # set initial visibility
+        self._update_fname_preview()
         return grp
+
+    def _on_numbering_mode_changed(self, _checked=None):
+        num_mode = self._rb_num.isChecked()
+        self._scan_num_lbl.setVisible(num_mode)
+        self._scan_num.setVisible(num_mode)
+        self._auto_inc.setVisible(num_mode)
+        self._update_fname_preview()
+
+    def _update_fname_preview(self):
+        self._fname_preview.setText(Path(self._current_filename()).name)
 
     def _build_scan_group(self):
         grp = QGroupBox("1-D Scan Parameters"); grp.setStyleSheet(GRP_STYLE)
@@ -672,9 +772,12 @@ class DAQTab(QWidget):
     def _current_filename(self):
         d      = self._dir_edit.text().strip() or "."
         prefix = self._prefix_edit.text().strip() or "scan"
-        num    = self._scan_num.value()
         ext    = {0:".h5", 1:".csv", 2:".dat"}.get(self._fmt_combo.currentIndex(), ".dat")
-        return f"{d}/{prefix}_{num:04d}{ext}"
+        if self._rb_ts.isChecked():
+            suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        else:
+            suffix = f"{self._scan_num.value():04d}"
+        return f"{d}/{prefix}_{suffix}{ext}"
 
     def _set_state(self, state: str):
         self._state = state
@@ -700,6 +803,9 @@ class DAQTab(QWidget):
         self._scan_idx = 0
         self._scan_t0  = time.monotonic()
         fname  = self._current_filename()
+        if self._rb_num.isChecked() and self._auto_inc.isChecked():
+            self._scan_num.setValue(self._scan_num.value() + 1)
+            self._update_fname_preview()
         motor  = self._motor_combo.currentText()
         det    = self._det_combo.currentText()
 

@@ -109,10 +109,17 @@
       "description": "Default filename prefix for new scans",
       "default":     "scan"
     },
+    "filename_mode": {
+      "type":        "choice",
+      "label":       "Filename mode",
+      "description": "Whether the file suffix is a zero-padded scan number or a timestamp",
+      "default":     "number",
+      "choices":     ["number", "timestamp"]
+    },
     "auto_increment": {
       "type":        "bool",
       "label":       "Auto-increment scan number",
-      "description": "Automatically increment the scan counter after each run",
+      "description": "Automatically increment the scan counter after each run (number mode only)",
       "default":     true
     },
     "default_format": {
