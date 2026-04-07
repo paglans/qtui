@@ -308,7 +308,10 @@ class TiledWriter:
 
         try:
             container = self._get_container()
-            node = container.write_table(df, metadata=metadata)
+            scan_num  = metadata.get("scan_num", 0)
+            ts        = metadata.get("timestamp", "")[:19].replace(":", "").replace("-", "")
+            key       = f"scan_{scan_num:04d}_{ts}"
+            node = container.write_dataframe(df, key=key, metadata=metadata)
             return True, str(node.uri)
         except Exception as exc:
             # Connection may have dropped — invalidate so next call retries.
