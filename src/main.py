@@ -12,6 +12,8 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
     "--disable-software-rasterizer "
     "--no-sandbox --disable-dev-shm-usage"
 )
+os.environ.setdefault("EPICS_CA_CONN_TMO",     "30.0")
+os.environ.setdefault("EPICS_CA_BEACON_PERIOD", "15.0")
 
 import sys
 from pathlib import Path
@@ -32,7 +34,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AMBER / HiRRIXS Control GUI")
-        self.resize(1600, 1100)
+        self.resize(2000, 1100)
         self._apply_palette()
 
         base = Path(__file__).parent.parent / "config"
@@ -71,7 +73,8 @@ class MainWindow(QMainWindow):
         beamline_tab   = BeamlineTab(amber_cfg, all_signals, all_pvs)
         endstation_tab = EndstationTab(hirrixs_cfg, amber_cfg, all_pvs, all_signals)
         config_tab     = ConfigurationTab()
-        daq_tab        = DAQTab(amber_cfg, hirrixs_cfg, config_tab)
+        app_cfg        = load_json(base / "configuration.json")
+        daq_tab        = DAQTab(amber_cfg, hirrixs_cfg, config_tab=config_tab, app_cfg=app_cfg)
         blop_tab       = BLOPTab(amber_cfg, hirrixs_cfg)
 
         tabs.addTab(beamline_tab,   "🔬  AMBER Beamline")

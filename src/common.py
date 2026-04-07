@@ -41,6 +41,14 @@ except ImportError:
     MPL_AVAILABLE = False
     print("[INFO] matplotlib not found – plots unavailable")
 
+# ── Optional: tiled ───────────────────────────────────────────────────────────
+try:
+    from tiled.client import from_uri as _tiled_from_uri
+    TILED_AVAILABLE = True
+except ImportError:
+    TILED_AVAILABLE = False
+    print("[INFO] tiled not found – Tiled output unavailable")
+
 # ── Optional: PySide6-WebEngine ───────────────────────────────────────────────
 try:
     from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -166,6 +174,7 @@ class PVMonitor:
                     auto_monitor=True,
                     connection_callback=partial(self._ccb, name),
                     connection_timeout=0.001)
+                epics.ca.poll(evt=0.002)   # yield to CA context after each PV creation
             except Exception as e:
                 print(f"[WARN] PV '{name}': {e}")
                 self._pvs[name] = None
@@ -241,7 +250,112 @@ class PVLabel(QLabel):
             except Exception:
                 self.setText(str(value)[:14])
                 self.setStyleSheet("color:#ffca28; font-family:monospace;")
-                
+
+# ── TiledWriter ───────────────────────────────────────────────────────────────
+class TiledWriter:
+    """
+    Thin wrapper around the Tiled Python client for writing scan data.
+
+    Connection is established lazily on the first write attempt so that
+    startup is never blocked.  The API key is read from the environment
+    variable TILED_SINGLE_USER_API_KEY at connection time; it is never
+    stored in configuration.json.
+
+    Usage
+    -----
+    writer = TiledWriter(cfg)          # cfg = config["tiled"] dict
+    ok, msg = writer.write_scan(df, metadata)
+
+    Parameters in cfg dict
+    ----------------------
+    enabled   : bool   – master switch (checked before every write)
+    host      : str    – server hostname, e.g. "localhost"
+    port      : int    – server port,     e.g. 8000
+    container : str    – top-level container name, e.g. "amber"
+    """
+
+    _ENV_KEY = "TILED_SINGLE_USER_API_KEY"
+
+    def __init__(self, cfg: dict):
+        self._cfg     = cfg
+        self._client  = None   # lazily initialised
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def write_scan(self, df, metadata: dict) -> tuple[bool, str]:
+        """
+        Write a completed 1-D scan as a Tiled table.
+
+        Parameters
+        ----------
+        df       : pandas.DataFrame  – columns are motor name and detector name
+        metadata : dict              – arbitrary scan metadata (scan_num, motor,
+                                       detector, timestamp, facility, …)
+
+        Returns
+        -------
+        (True,  "uri/key")   on success
+        (False, "error msg") on failure or when disabled/unavailable
+        """
+        if not TILED_AVAILABLE:
+            return False, "tiled package not installed"
+        if not self._cfg.get("enabled", False):
+            return False, "Tiled disabled in configuration"
+
+        ok, msg = self._ensure_connected()
+        if not ok:
+            return False, msg
+
+        try:
+            container = self._get_container()
+            node = container.write_table(df, metadata=metadata)
+            return True, str(node.uri)
+        except Exception as exc:
+            # Connection may have dropped — invalidate so next call retries.
+            self._client = None
+            return False, f"Tiled write error: {exc}"
+
+    def check_connection(self) -> tuple[bool, str]:
+        """
+        Probe the server without writing.  Returns (ok, message).
+        Useful for a "Test connection" button in the UI.
+        """
+        if not TILED_AVAILABLE:
+            return False, "tiled package not installed"
+        self._client = None          # force reconnect
+        ok, msg = self._ensure_connected()
+        if ok:
+            return True, f"Connected to {self._base_uri()}"
+        return False, msg
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _base_uri(self) -> str:
+        host = self._cfg.get("host", "localhost")
+        port = int(self._cfg.get("port", 8000))
+        return f"http://{host}:{port}"
+
+    def _ensure_connected(self) -> tuple[bool, str]:
+        if self._client is not None:
+            return True, "ok"
+        import os
+        api_key = os.environ.get(self._ENV_KEY, "").strip() or None
+        try:
+            uri = self._base_uri()
+            self._client = _tiled_from_uri(uri, api_key=api_key)
+            return True, "ok"
+        except Exception as exc:
+            return False, f"Tiled connection failed ({self._base_uri()}): {exc}"
+
+    def _get_container(self):
+        """Return (creating if necessary) the top-level container node."""
+        name = self._cfg.get("container", "amber")
+        try:
+            return self._client[name]
+        except KeyError:
+            # Container doesn't exist yet — create it.
+            return self._client.create_container(key=name)
+
 # ── Table helper ──────────────────────────────────────────────────────────────
 from PySide6.QtWidgets import QGridLayout, QGroupBox
 from PySide6.QtGui import QFont

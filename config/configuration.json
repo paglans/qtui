@@ -20,6 +20,12 @@
     "auto_increment": true,
     "default_format": "HDF5"
   },
+  "tiled": {
+    "enabled":    true,
+    "host":       "localhost",
+    "port":       8000,
+    "container":  "amber"
+  },
   "ui": {
     "strip_chart_history_s": 300,
     "strip_chart_update_ms": 1000,

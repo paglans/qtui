@@ -20,7 +20,7 @@ from PySide6.QtGui import QFont, QColor
 
 from common import (
     PAL, COMBO_STYLE, BTN_STYLE, GRP_STYLE, INPUT_STYLE, SPLITTER_STYLE,
-    MPL_AVAILABLE, EPICS_AVAILABLE, PVMonitor, PVLabel,
+    MPL_AVAILABLE, EPICS_AVAILABLE, TILED_AVAILABLE, TiledWriter, PVMonitor, PVLabel,
 )
 
 if MPL_AVAILABLE:
@@ -31,10 +31,25 @@ import csv
 import numpy as np
 
 try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+
+try:
     import h5py
     H5_AVAILABLE = True
 except ImportError:
     H5_AVAILABLE = False
+
+from scan_types import (
+        ALL_SCAN_TYPES, DET_SCALAR, DET_AREA,
+        detector_kind, sim_scalar,
+        _AREA_LABELS, _AREA_COLORS,
+    )
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+SCAN_ACQ_TIMEOUT_S = 30.0   # max seconds to wait for area-detector acquire
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 SPIN_STYLE = f"""
@@ -166,6 +181,7 @@ class ScanPlot(QWidget):
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             vl.addWidget(ph)
         self._xs: list = []; self._ys: list = []
+        self.ys: list[float] = []
 
     def _style_ax(self):
         ax = self._ax; ax.set_facecolor(PAL["bg"])
@@ -185,12 +201,14 @@ class ScanPlot(QWidget):
         self._ax.set_title(title or "Scan in progress …",
                            color=PAL["text"], fontsize=9)
         self._ax.relim(); self._canvas.draw_idle()
+        self.ys = []
 
     def add_point(self, x, y):
         self._xs.append(x); self._ys.append(y)
         if not MPL_AVAILABLE: return
         self._line.set_data(self._xs, self._ys)
         self._ax.relim(); self._ax.autoscale_view(); self._canvas.draw_idle()
+        self.ys.append(y)
 
     def finish(self, title=""):
         if not MPL_AVAILABLE: return
@@ -198,39 +216,34 @@ class ScanPlot(QWidget):
                            color=PAL["ok"], fontsize=9)
         self._canvas.draw_idle()
 
-
-
 class ScanFileWriter:
-    """Writes 1-D scan data to HDF5, CSV, or SPEC (.dat) files.
+    """Write 1-D or multi-column scan data to HDF5, CSV, or SPEC (.dat).
 
-    Column layout in every format
-    ──────────────────────────────
-      col 0          : scan motor  (x axis)
-      col 1          : selected detector  (y axis / plotted signal)
-      cols 2 .. N    : all remaining signals then all remaining motors
-                       (alphabetical within each group, scan motor excluded)
+    Column layout
+    ─────────────
+      col 0          : scan motor (or "_time_s" for time scans)
+      col 1          : selected detector  (y-axis / plotted signal)
+      cols 2..N      : remaining signals then motors, sorted alphabetically
 
-    Lifecycle
-    ─────────
-      writer.open(path, meta, columns)   # scan start
-      writer.write_point(x, y, extras)   # each step  – flushes immediately
-      writer.close()                     # normal finish
-      writer.close(aborted=True)         # abort
+    Lifecycle:  open() → write_point() × N → close()
+    For area detectors, write_image() can be called after each write_point().
     """
 
     FMT_HDF5 = 0
     FMT_CSV  = 1
     FMT_SPEC = 2
 
+    _ACQ_RBV = ":cam1:Acquire_RBV"   # mirrors DetectorImageViewer constant
+
     def __init__(self):
-        self._fmt      = None
-        self._path     = None
-        self._meta: dict   = {}
-        self._columns: list = []   # ordered column names (excl. scan motor)
-        # per-column buffers (HDF5 writes arrays at close)
-        self._xs: list = []
-        self._data: dict = {}      # name → list[float]
-        # file handles
+        self._fmt       = None
+        self._path      = None
+        self._meta: dict = {}
+        self._columns: list = []
+        self._xs:   list = []
+        self._data: dict = {}
+        self._img_idx   = 0
+        # handles
         self._h5file    = None
         self._csvfile   = None
         self._csvwriter = None
@@ -241,19 +254,13 @@ class ScanFileWriter:
     def open(self, path: str, meta: dict, columns: list) -> bool:
         """Open file and write header.
 
-        Parameters
-        ----------
-        path    : full output path; extension selects format.
-        meta    : scan metadata (motor, detector, start, stop, steps,
-                  exposure, scan_num, prefix).
-        columns : ordered list of extra channel names written after the
-                  scan-motor column.  The selected detector must be first.
+        meta keys: motor, detector, start, stop, steps,
+                   exposure, scan_num, prefix, scan_type, det_kind
+        columns  : ordered extra channel names; selected detector must be first.
         """
-        self._path    = path
-        self._meta    = meta
-        self._columns = list(columns)
-        self._xs      = []
-        self._data    = {c: [] for c in self._columns}
+        self._path, self._meta, self._columns = path, meta, list(columns)
+        self._xs = []; self._data = {c: [] for c in self._columns}
+        self._img_idx = 0
         ext = Path(path).suffix.lower()
         self._fmt = {".h5": self.FMT_HDF5,
                      ".csv": self.FMT_CSV,
@@ -267,15 +274,7 @@ class ScanFileWriter:
             return False
 
     def write_point(self, x: float, y: float, extras: dict):
-        """Append one row.
-
-        Parameters
-        ----------
-        x      : scan-motor position
-        y      : selected-detector reading (must equal extras[columns[0]])
-        extras : {channel_name: float} for every channel in self._columns.
-                 Missing channels are stored as NaN.
-        """
+        """Append one row; extras = {channel_name: float} for all columns."""
         self._xs.append(x)
         row = []
         for c in self._columns:
@@ -288,12 +287,26 @@ class ScanFileWriter:
                     [f"{x:.6g}"] + [_fmt_val(v) for v in row])
                 self._csvfile.flush()
             elif self._fmt == self.FMT_SPEC and self._specfile:
-                vals = "  ".join([f"{x:.6g}"] + [_fmt_val(v) for v in row])
-                self._specfile.write(f"  {vals}\n")
+                self._specfile.write(
+                    "  " + "  ".join([f"{x:.6g}"] +
+                                     [_fmt_val(v) for v in row]) + "\n")
                 self._specfile.flush()
-            # HDF5: buffered; written as arrays at close()
         except Exception as exc:
             print(f"[ScanFileWriter] write_point error: {exc}")
+
+    def write_image(self, img: "np.ndarray"):
+        """Store one area-detector frame (HDF5 only).
+        Call immediately after the matching write_point().
+        """
+        if self._fmt != self.FMT_HDF5 or self._h5file is None:
+            return
+        try:
+            grp = self._h5file["scan"].require_group("images")
+            grp.create_dataset(f"img_{self._img_idx:05d}", data=img,
+                               compression="gzip", compression_opts=4)
+            self._img_idx += 1
+        except Exception as exc:
+            print(f"[ScanFileWriter] write_image error: {exc}")
 
     def close(self, aborted: bool = False):
         try:
@@ -316,71 +329,63 @@ class ScanFileWriter:
         meta.attrs["timestamp"]   = datetime.now().isoformat()
         meta.attrs["file_format"] = "AMBER_HiRRIXS_HDF5_v1"
         meta.attrs["beamline"]    = "ALS BL601 AMBER"
-        meta.attrs["columns"]     = [self._meta.get("motor", "motor")]  \
-                                    + self._columns
+        meta.attrs["columns"]     = (
+            [self._meta.get("motor", "motor")] + self._columns)
         return True
 
     def _close_hdf5(self, aborted: bool):
-        if not self._h5file:
-            return
+        if not self._h5file: return
         grp  = self._h5file["scan"]
         data = grp.create_group("data")
         motor_name = self._meta.get("motor", "motor")
-        xs = np.array(self._xs, dtype=np.float64)
-        ds = data.create_dataset(motor_name, data=xs)
-        ds.attrs["role"]  = "scan_motor"
-        ds.attrs["units"] = "user"
+        ds_x = data.create_dataset(motor_name,
+                                   data=np.array(self._xs, dtype=np.float64))
+        ds_x.attrs["role"] = "scan_motor"; ds_x.attrs["units"] = "user"
         for i, col in enumerate(self._columns):
             arr  = np.array(self._data[col], dtype=np.float64)
             ds_c = data.create_dataset(col, data=arr)
             ds_c.attrs["role"]  = "detector" if i == 0 else "channel"
             ds_c.attrs["units"] = "counts"
-        grp.attrs["n_points"] = len(xs)
+        grp.attrs["n_points"] = len(self._xs)
         grp.attrs["aborted"]  = aborted
-        self._h5file.close()
-        self._h5file = None
+        grp.attrs["n_images"] = self._img_idx
+        self._h5file.close(); self._h5file = None
 
     # ── CSV ───────────────────────────────────────────────────────────────────
 
     def _open_csv(self) -> bool:
-        m   = self._meta
-        now = datetime.now()
+        m, now = self._meta, datetime.now()
         self._csvfile = open(self._path, "w", newline="")
+        hdr_cols = [m.get("motor", "motor")] + self._columns
         for line in [
             f"# AMBER HiRRIXS scan — {Path(self._path).stem}",
             f"# Date:     {now.strftime('%Y-%m-%d %H:%M:%S')}",
             f"# Beamline: ALS BL601 AMBER",
+            f"# Scan type:{m.get('scan_type','?')}",
             f"# Motor:    {m.get('motor','?')}",
-            f"# Detector: {m.get('detector','?')}  (plotted column)",
-            f"# Range:    {m.get('start','?')} → {m.get('stop','?')}  "
-            f"({m.get('steps','?')} steps)",
+            f"# Detector: {m.get('detector','?')}  [{m.get('det_kind','?')}]  (plotted column)",
+            f"# Range:    {m.get('start','?')} → {m.get('stop','?')}  ({m.get('steps','?')} pts)",
             f"# Exposure: {m.get('exposure','?')} s",
             f"# Scan #:   {m.get('scan_num','?')}",
-            f"# Columns:  {m.get('motor','motor')}, "
-            + ", ".join(self._columns),
+            f"# Columns:  {', '.join(hdr_cols)}",
         ]:
             self._csvfile.write(line + "\n")
         self._csvwriter = csv.writer(self._csvfile)
-        self._csvwriter.writerow(
-            [m.get("motor", "motor")] + self._columns)
+        self._csvwriter.writerow(hdr_cols)
         self._csvfile.flush()
         return True
 
     def _close_csv(self, aborted: bool):
-        if not self._csvfile:
-            return
+        if not self._csvfile: return
         if aborted:
-            self._csvfile.write(
-                f"# Scan aborted after {len(self._xs)} points\n")
+            self._csvfile.write(f"# Aborted after {len(self._xs)} points\n")
         self._csvfile.close()
-        self._csvfile   = None
-        self._csvwriter = None
+        self._csvfile = None; self._csvwriter = None
 
     # ── SPEC (.dat) ───────────────────────────────────────────────────────────
 
     def _open_spec(self) -> bool:
-        m   = self._meta
-        now = datetime.now()
+        m, now = self._meta, datetime.now()
         motor    = m.get("motor",    "motor")
         det      = m.get("detector", "detector")
         start    = m.get("start",    0)
@@ -388,54 +393,66 @@ class ScanFileWriter:
         steps    = m.get("steps",    1)
         exposure = m.get("exposure", 1.0)
         scan_num = m.get("scan_num", 1)
-        n_cols   = 1 + len(self._columns)   # motor + all channels
+        scan_cmd = m.get("scan_type", "ascan").lower().replace(" ", "_")
+        n_cols   = 1 + len(self._columns)
 
         self._specfile = open(self._path, "w")
         f = self._specfile
         f.write(f"#F {Path(self._path).name}\n")
         f.write(f"#E {int(now.timestamp())}\n")
         f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
-        f.write(f"#C AMBER HiRRIXS  ALS BL601  "
-                f"User={m.get('prefix','scan')}\n")
-        f.write("\n")
-        f.write(f"#S {scan_num} ascan {motor} {start} {stop} "
+        f.write(f"#C AMBER HiRRIXS  ALS BL601  User={m.get('prefix','scan')}\n\n")
+        f.write(f"#S {scan_num} {scan_cmd} {motor} {start} {stop} "
                 f"{steps - 1} {exposure}\n")
         f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
         f.write(f"#T {exposure}  (Seconds)\n")
-        f.write(f"#C Plotted detector: {det}\n")
+        f.write(f"#C Plotted detector: {det}  [{m.get('det_kind','?')}]\n")
         f.write(f"#N {n_cols}\n")
         f.write(f"#L {motor}  " + "  ".join(self._columns) + "\n")
         f.flush()
         return True
 
     def _close_spec(self, aborted: bool):
-        if not self._specfile:
-            return
+        if not self._specfile: return
         if aborted:
-            self._specfile.write(
-                f"#C Scan aborted after {len(self._xs)} points\n")
+            self._specfile.write(f"#C Aborted after {len(self._xs)} points\n")
         self._specfile.write("\n")
-        self._specfile.close()
-        self._specfile = None
-
+        self._specfile.close(); self._specfile = None
 
 def _fmt_val(v: float) -> str:
-    """Format a channel value; NaN → 'nan' (keeps columns aligned)."""
     return "nan" if (v != v) else f"{v:.6g}"
-
 
 # ── DAQ Tab ───────────────────────────────────────────────────────────────────
 SCAN_DWELL_MS = 200
 
 class DAQTab(QWidget):
-    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict, config_tab=None, parent=None):
+    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict, config_tab=None, app_cfg=None, parent=None):
         # Store for apply_config use
         self._config_tab = config_tab
+        self._app_cfg = app_cfg or {}
+        tiled_cfg     = self._app_cfg.get("tiled", {})
+        self._tiled   = TiledWriter(tiled_cfg)
         super().__init__(parent)
         self.setStyleSheet(f"background:{PAL['bg']};")
         self._state = _ScanState.IDLE
         self._writer: ScanFileWriter | None = None
         self._scan_columns: list = []   # ordered extra channel names
+        # active scan type (BaseScan instance, one per type kept alive)
+        self._scan_instances = [ST() for ST in ALL_SCAN_TYPES]
+        self._active_scan_idx = 0        # index into _scan_instances
+ 
+        # area-detector state
+        self._det_kind   = DET_SCALAR
+        self._acquiring  = False
+        self._acq_deadline = 0.0
+        self._last_outer:      int   = -1
+        self._last_area_scalar:float = float("nan")
+        # store base PV prefix for each area detector (needed to trigger)
+        self._det_pvs:  dict = {}
+        self._det_base: dict = {}
+        for n, p in hirrixs_cfg.get("detector", {}).items():
+            self._det_base[n] = p                  # base prefix, e.g. "6013SIM1"
+            self._det_pvs[n]  = p + ":Acquire_RBV" # CA readback PV
         self._scan_idx = 0; self._scan_positions: list = []
         self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
 
@@ -576,7 +593,7 @@ class DAQTab(QWidget):
             if value in fmt_map:
                 self._fmt_combo.setCurrentIndex(fmt_map[value])
         self._update_fname_preview()
-        
+
     # ── UI builders ───────────────────────────────────────────────────────────
     def _build_file_group(self):
         grp = QGroupBox("File Output"); grp.setStyleSheet(GRP_STYLE)
@@ -628,6 +645,30 @@ class DAQTab(QWidget):
         self._auto_inc.setStyleSheet(CHECK_STYLE); self._auto_inc.setChecked(True)
         gl.addWidget(self._auto_inc, 5, 0, 1, 3)
 
+        # ── Tiled output ──────────────────────────────────────────────────────
+        self._tiled_chk = QCheckBox("Save to Tiled server")
+        self._tiled_chk.setStyleSheet(CHECK_STYLE)
+        # Default: enabled if tiled section says so AND package is available.
+        tiled_cfg = self._app_cfg.get("tiled", {})
+        self._tiled_chk.setChecked(
+            TILED_AVAILABLE and tiled_cfg.get("enabled", False)
+        )
+        if not TILED_AVAILABLE:
+            self._tiled_chk.setEnabled(False)
+            self._tiled_chk.setToolTip("tiled package not installed")
+        gl.addWidget(self._tiled_chk, 5, 0, 1, 2)
+
+        # "Test" button — quick connection probe without running a scan.
+        self._tiled_test_btn = QPushButton("Test")
+        self._tiled_test_btn.setStyleSheet(BTN_STYLE)
+        self._tiled_test_btn.setFixedWidth(48)
+        self._tiled_test_btn.setEnabled(TILED_AVAILABLE)
+        self._tiled_test_btn.clicked.connect(self._test_tiled)
+        gl.addWidget(self._tiled_test_btn, 5, 2)
+
+        #return grp
+
+
         # ── Preview label ─────────────────────────────────────────────────────
         gl.addWidget(ql("Preview"), 6, 0)
         self._fname_preview = QLabel("")
@@ -649,6 +690,14 @@ class DAQTab(QWidget):
         self._update_fname_preview()
         return grp
 
+     # ── Tiled connection test ─────────────────────────────────────────────────
+    def _test_tiled(self):
+        ok, msg = self._tiled.check_connection()
+        if ok:
+            self._log_msg(f"🔵 Tiled: {msg}", PAL["ok"])
+        else:
+            self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
+
     def _on_numbering_mode_changed(self, _checked=None):
         num_mode = self._rb_num.isChecked()
         self._scan_num_lbl.setVisible(num_mode)
@@ -659,42 +708,68 @@ class DAQTab(QWidget):
     def _update_fname_preview(self):
         self._fname_preview.setText(Path(self._current_filename()).name)
 
+    
+
     def _build_scan_group(self):
-        grp = QGroupBox("1-D Scan Parameters"); grp.setStyleSheet(GRP_STYLE)
-        gl = QGridLayout(grp); gl.setContentsMargins(8,20,8,8); gl.setSpacing(8)
+        from PySide6.QtWidgets import QStackedWidget, QFrame
 
-        def ql(t):
-            lb = QLabel(t); lb.setStyleSheet(f"color:{PAL['subtext']};"); return lb
+        def _ql_s(text: str) -> QLabel:
+            """Subtext-coloured label for scan group rows."""
+            lb = QLabel(text)
+            lb.setStyleSheet(f"color:{PAL['subtext']};")
+            return lb
 
-        gl.addWidget(ql("Motor"), 0, 0)
-        self._motor_combo = QComboBox(); self._motor_combo.setStyleSheet(COMBO_STYLE)
-        for n in self._motor_pvs: self._motor_combo.addItem(n)
-        gl.addWidget(self._motor_combo, 0, 1, 1, 3)
+        grp = QGroupBox("Scan Parameters"); grp.setStyleSheet(GRP_STYLE)
+        vl  = QVBoxLayout(grp); vl.setContentsMargins(8, 20, 8, 8); vl.setSpacing(8)
 
-        gl.addWidget(ql("Detector"), 1, 0)
+        # ── Scan type selector ────────────────────────────────────────────────
+        row_type = QHBoxLayout()
+        row_type.addWidget(_ql_s("Scan type"))
+        self._type_combo = QComboBox(); self._type_combo.setStyleSheet(COMBO_STYLE)
+        for st in self._scan_instances:
+            self._type_combo.addItem(st.LABEL)
+        row_type.addWidget(self._type_combo, 1)
+        vl.addLayout(row_type)
+
+        # ── Stacked parameter panel (one page per scan type) ──────────────────
+        self._scan_stack = QStackedWidget()
+        motor_names = list(self._motor_pvs.keys())
+        for inst in self._scan_instances:
+            w = inst.build_widget(motor_names)
+            self._scan_stack.addWidget(w)
+        vl.addWidget(self._scan_stack)
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep)
+
+        # ── Detector (shared across all scan types) ───────────────────────────
+        row_det = QHBoxLayout()
+        row_det.addWidget(_ql_s("Detector"))
         self._det_combo = QComboBox(); self._det_combo.setStyleSheet(COMBO_STYLE)
-        for n in {**self._signal_pvs, **self._det_pvs}: self._det_combo.addItem(n)
-        gl.addWidget(self._det_combo, 1, 1, 1, 3)
+        for n in {**self._signal_pvs, **self._det_pvs}:
+            self._det_combo.addItem(n)
+        row_det.addWidget(self._det_combo, 1)
+        self._det_badge = QLabel("scalar")
+        self._det_badge.setStyleSheet(
+            f"color:{PAL['ok']}; font-size:8pt; font-style:italic;")
+        row_det.addWidget(self._det_badge)
+        vl.addLayout(row_det)
 
-        for row, (lbl, attr, val, lo, hi, dec) in enumerate([
-            ("Start",    "_p_start", -10.0, -1e6, 1e6, 4),
-            ("Stop",     "_p_stop",   10.0, -1e6, 1e6, 4),
-            ("Steps",    None,        None, None, None, None),
-            ("Exposure", "_p_exp",    0.5,  0.001, 3600.0, 3),
-        ], 2):
-            gl.addWidget(ql(lbl), row, 0)
-            if lbl == "Steps":
-                self._p_steps = QSpinBox(); self._p_steps.setRange(2, 10000)
-                self._p_steps.setValue(21); self._p_steps.setStyleSheet(SPIN_STYLE)
-                gl.addWidget(self._p_steps, row, 1, 1, 3)
-            else:
-                sp = QDoubleSpinBox(); sp.setRange(lo, hi); sp.setValue(val)
-                sp.setDecimals(dec); sp.setStyleSheet(SPIN_STYLE)
-                setattr(self, attr, sp); gl.addWidget(sp, row, 1, 1, 3)
+        # ── Exposure ──────────────────────────────────────────────────────────
+        row_exp = QHBoxLayout()
+        row_exp.addWidget(_ql_s("Exposure (s)"))
+        self._p_exp = QDoubleSpinBox()
+        self._p_exp.setRange(0.001, 3600.0); self._p_exp.setValue(0.5)
+        self._p_exp.setDecimals(3); self._p_exp.setStyleSheet(SPIN_STYLE)
+        row_exp.addWidget(self._p_exp, 1)
+        vl.addLayout(row_exp)
 
-        self._rel_scan = QCheckBox("Relative scan (from current position)")
-        self._rel_scan.setStyleSheet(CHECK_STYLE)
-        gl.addWidget(self._rel_scan, 6, 0, 1, 4)
+        # ── Connect signals ───────────────────────────────────────────────────
+        self._type_combo.currentIndexChanged.connect(self._on_scan_type_changed)
+        self._det_combo.currentTextChanged.connect(self._on_det_changed)
+        self._on_det_changed(self._det_combo.currentText())   # initialise badge
+
         return grp
 
     def _build_run_group(self):
@@ -791,46 +866,74 @@ class DAQTab(QWidget):
         self._st_state.setStyleSheet(
             f"color:{colors.get(state, PAL['text'])}; font-family:monospace; font-size:8pt;")
 
+    def _on_scan_type_changed(self, idx: int):
+        self._active_scan_idx = idx
+        self._scan_stack.setCurrentIndex(idx)
+
+    def _on_det_changed(self, name: str = ""):
+        name = name or self._det_combo.currentText()
+        kind = detector_kind(name, self._signal_pvs, self._det_pvs)
+        self._det_kind = kind
+        self._det_badge.setText(_AREA_LABELS[kind])
+        self._det_badge.setStyleSheet(
+            f"color:{_AREA_COLORS[kind]}; font-size:8pt; font-style:italic;")
+        if kind == DET_AREA:
+            # Area detectors require HDF5 for image storage
+            self._fmt_combo.setCurrentIndex(0)
+            self._fmt_combo.setEnabled(False)
+            self._log_msg(
+                f"ℹ  Area detector selected — format locked to HDF5.",
+                PAL["warn"])
+        else:
+            self._fmt_combo.setEnabled(True)
+
     # ── Scan engine ───────────────────────────────────────────────────────────
-    def _start_scan(self):                          # REPLACE existing method
+    def _start_scan(self):
         if self._state == _ScanState.RUNNING:
             return
-        n     = self._p_steps.value()
-        start = self._p_start.value()
-        stop  = self._p_stop.value()
-        step  = (stop - start) / max(n - 1, 1)
-        self._scan_positions = [start + i * step for i in range(n)]
-        self._scan_idx = 0
-        self._scan_t0  = time.monotonic()
-        fname  = self._current_filename()
-        if self._rb_num.isChecked() and self._auto_inc.isChecked():
-            self._scan_num.setValue(self._scan_num.value() + 1)
-            self._update_fname_preview()
-        motor  = self._motor_combo.currentText()
-        det    = self._det_combo.currentText()
 
-        # ── Build ordered column list ─────────────────────────────────────────
-        # Layout: [selected_detector, ...other signals α, ...other motors α]
-        other_signals = sorted(
-            k for k in self._signal_pvs if k != det)
-        other_motors  = sorted(
-            k for k in self._motor_pvs  if k != motor and k != det)
+        scan   = self._scan_instances[self._active_scan_idx]
+        det    = self._det_combo.currentText()
+        kind   = self._det_kind
+        fname  = self._current_filename()
+
+        # Build position sequence
+        positions = scan.build_positions()
+        if not positions:
+            self._log_msg("⚠ No scan positions — check parameters.", PAL["nc"])
+            return
+        self._scan_positions = positions
+        self._scan_idx  = 0
+        self._scan_t0   = time.monotonic()
+        self._acquiring = False
+        self._last_outer = -1
+
+        x_lbl, y_lbl = scan.plot_axes()
+
+        # ── Column list: [det, other signals α, other motors α] ───────────────
+        other_signals = sorted(k for k in self._signal_pvs if k != det)
+        other_motors  = sorted(k for k in self._motor_pvs
+                               if k not in {det, scan.outer_motor()})
         self._scan_columns = (
             [det]
-            + [k for k in other_signals if k not in (det,)]
-            + [k for k in other_motors  if k not in (det,)]
+            + [k for k in other_signals if k != det]
+            + [k for k in other_motors  if k != det]
         )
 
-        # ── Open file writer ──────────────────────────────────────────────────
+        # ── Open file ─────────────────────────────────────────────────────────
+        first_pos = positions[0]
+        # Use x-axis label as the "motor" field in metadata
         meta = dict(
-            motor    = motor,
-            detector = det,
-            start    = start,
-            stop     = stop,
-            steps    = n,
-            exposure = self._p_exp.value(),
-            scan_num = self._scan_num.value(),
-            prefix   = self._prefix_edit.text().strip() or "scan",
+            scan_type = scan.LABEL,
+            motor     = x_lbl,
+            detector  = det,
+            det_kind  = kind,
+            start     = first_pos["_x"],
+            stop      = positions[-1]["_x"],
+            steps     = len(positions),
+            exposure  = self._p_exp.value(),
+            scan_num  = self._scan_num.value(),
+            prefix    = self._prefix_edit.text().strip() or "scan",
         )
         self._writer = ScanFileWriter()
         if not self._writer.open(fname, meta, self._scan_columns):
@@ -851,28 +954,27 @@ class DAQTab(QWidget):
             )
             dlg.setStandardButtons(QMessageBox.Abort | QMessageBox.Ignore)
             dlg.setDefaultButton(QMessageBox.Abort)
-            dlg.setStyleSheet(
-                f"background:{PAL['surface']}; color:{PAL['text']};")
+            dlg.setStyleSheet(f"background:{PAL['surface']}; color:{PAL['text']};")
             if dlg.exec() == QMessageBox.Abort:
                 self._set_state(_ScanState.IDLE)
                 self._reset_run_btns()
                 return
 
-        self._scan_plot.reset(motor, det, f"{det}  vs  {motor}")
-        self._progress.setMaximum(n)
-        self._progress.setValue(0)
+        # ── UI updates ────────────────────────────────────────────────────────
+        n = len(positions)
+        self._scan_plot.reset(x_lbl, det, f"{det}  vs  {x_lbl}")
+        self._progress.setMaximum(n); self._progress.setValue(0)
         self._st_file.setText(Path(fname).name)
         self._st_file.setStyleSheet(
             f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
         n_extra = len(self._scan_columns) - 1
-        self._log_msg(f"▶ Scan started  →  {fname}", PAL["ok"])
-        self._log_msg(
-            f"   Motor: {motor}  |  Det: {det}  |  {n} points  "
-            f"[{start:.4g} → {stop:.4g}]  |  +{n_extra} extra channels")
+        self._log_msg(f"▶ {scan.scan_label()}  →  {fname}", PAL["ok"])
+        self._log_msg(f"   Det: {det} [{kind}]  |  +{n_extra} extra channels"
+                      + (f"  |  area-det timeout: {SCAN_ACQ_TIMEOUT_S:.0f} s"
+                         if kind == DET_AREA else ""))
         self._set_state(_ScanState.RUNNING)
         self._run_btn.setEnabled(False)
-        self._pause_btn.setEnabled(True)
-        self._abort_btn.setEnabled(True)
+        self._pause_btn.setEnabled(True); self._abort_btn.setEnabled(True)
         self._scan_timer.start(SCAN_DWELL_MS)
 
     def _pause_scan(self):
@@ -887,52 +989,93 @@ class DAQTab(QWidget):
             self._log_msg("▶ Scan resumed.", PAL["ok"])
             self._scan_timer.start(SCAN_DWELL_MS)
 
-    def _abort_scan(self):                          # REPLACE existing method
-        self._scan_timer.stop()
-        self._set_state(_ScanState.ABORTING)
-        if self._writer is not None:
-            self._writer.close(aborted=True)
-            self._writer = None
-        self._log_msg("■ Scan aborted.", PAL["nc"])
-        self._scan_plot.finish("Scan aborted")
-        self._reset_run_btns()
-
-    def _scan_step(self):                           # REPLACE existing method
+    def _scan_step(self):
         if self._state != _ScanState.RUNNING:
-            self._scan_timer.stop()
+            self._scan_timer.stop(); return
+
+        scan = self._scan_instances[self._active_scan_idx]
+        det  = self._det_combo.currentText()
+
+        # ── Poll area-detector completion ─────────────────────────────────────
+        if self._acquiring:
+            base   = self._det_base.get(det, "")
+            rbv_pv = base + ":cam1:Acquire_RBV" if base else ""
+            done   = True
+            if EPICS_AVAILABLE and rbv_pv:
+                raw  = PVMonitor().get(rbv_pv)
+                done = (raw is not None and float(raw) == 0)
+            if not done and time.monotonic() < self._acq_deadline:
+                return          # still acquiring — come back next tick
+            # Acquisition complete (or timed out) → read image, record point
+            y = self._last_area_scalar
+            if not done:
+                self._log_msg(
+                    f"⚠ Area detector timeout at point {self._scan_idx+1}",
+                    PAL["warn"])
+            self._acquiring = False
+            self._record_point(scan, y, det)
             return
+
+        # ── Advance to next position ──────────────────────────────────────────
         if self._scan_idx >= len(self._scan_positions):
-            self._finish_scan()
-            return
+            self._finish_scan(); return
 
-        x     = self._scan_positions[self._scan_idx]
-        motor = self._motor_combo.currentText()
-        det   = self._det_combo.currentText()
-        pv    = self._motor_pvs.get(motor, "")
-        if pv:
-            PVMonitor().put(pv, x)
+        pos = self._scan_positions[self._scan_idx]
 
-        # ── Read selected detector (plotted) ──────────────────────────────────
+        # Move all real motors in this step (skip "_"-prefixed keys)
+        for mname, setpoint in pos.items():
+            if mname.startswith("_"): continue
+            pv = self._motor_pvs.get(mname, "")
+            if pv: PVMonitor().put(pv, setpoint)
+
+        # For 2D: reset plot at each new outer step
+        if scan.n_outer() > 1:
+            outer_i = scan.outer_index(self._scan_idx)
+            if outer_i != self._last_outer:
+                x_lbl, _ = scan.plot_axes()
+                om = scan.outer_motor()
+                ov = pos.get(om, outer_i) if om else outer_i
+                om_str = f"{om}={ov:.4g}" if om else f"step {outer_i+1}"
+                self._scan_plot.reset(
+                    x_lbl, det,
+                    f"{det}  vs  {x_lbl}   [{om_str}"
+                    f"  {outer_i+1}/{scan.n_outer()}]")
+                self._last_outer = outer_i
+
+        # ── Acquire detector value ─────────────────────────────────────────────
+        if self._det_kind == DET_AREA:
+            # Trigger acquisition; poll in subsequent ticks
+            base   = self._det_base.get(det, "")
+            acq_pv = base + ":cam1:Acquire" if base else ""
+            if EPICS_AVAILABLE and acq_pv:
+                PVMonitor().put(acq_pv, 1)
+            self._acquiring      = True
+            self._acq_deadline   = time.monotonic() + SCAN_ACQ_TIMEOUT_S
+            self._last_area_scalar = float("nan")   # placeholder for plot
+            return   # don't advance _scan_idx yet; wait for completion
+
+        # Scalar detector: read immediately
         sig_pv = ({**self._signal_pvs, **self._det_pvs}).get(det, "")
         if EPICS_AVAILABLE and sig_pv:
             raw = PVMonitor().get(sig_pv)
             y   = float(raw) if raw is not None else float("nan")
         else:
-            mid = (self._scan_positions[0] + self._scan_positions[-1]) / 2
-            rng = abs(self._scan_positions[-1] - self._scan_positions[0]) or 1
-            y   = (500 * math.exp(-0.5 * ((x - mid) / (rng * 0.15)) ** 2)
-                   + random.gauss(0, 5))
+            y = sim_scalar(self._scan_positions, self._scan_idx)
+
+        self._record_point(scan, y, det)
+
+    def _record_point(self, scan, y: float, det: str):
+        """Advance scan index, update plot, write file row."""
+        pos = self._scan_positions[self._scan_idx]
+        x   = pos["_x"]
 
         self._scan_plot.add_point(x, y)
 
-        # ── Read all extra channels ───────────────────────────────────────────
+        # Read all extra channels
         extras: dict = {det: y}
-        all_readable = {**self._signal_pvs,
-                        **self._det_pvs,
-                        **self._motor_pvs}
+        all_readable = {**self._signal_pvs, **self._det_pvs, **self._motor_pvs}
         for col in self._scan_columns:
-            if col == det:
-                continue
+            if col == det: continue
             cpv = all_readable.get(col, "")
             if EPICS_AVAILABLE and cpv:
                 raw = PVMonitor().get(cpv)
@@ -940,7 +1083,6 @@ class DAQTab(QWidget):
             else:
                 extras[col] = float("nan")
 
-        # ── Write row to file ─────────────────────────────────────────────────
         if self._writer is not None:
             self._writer.write_point(x, y, extras)
 
@@ -954,17 +1096,72 @@ class DAQTab(QWidget):
         if self._scan_idx >= len(self._scan_positions):
             self._finish_scan()
 
-    def _finish_scan(self):                         # REPLACE existing method
+
+    def _finish_scan(self):
         self._scan_timer.stop()
         fname = self._current_filename()
-        if self._writer is not None:
-            self._writer.close(aborted=False)
-            self._writer = None
         self._scan_plot.finish(f"Scan complete — {Path(fname).name}")
         self._log_msg(f"✔ Scan complete.  File: {fname}", PAL["ok"])
+
+        # ── Tiled write ───────────────────────────────────────────────────────
+        if self._tiled_chk.isChecked():
+            self._write_tiled()
+
         if self._auto_inc.isChecked():
             self._scan_num.setValue(self._scan_num.value() + 1)
         self._set_state(_ScanState.IDLE)
+        self._reset_run_btns()
+
+    def _write_tiled(self):
+        """Assemble a DataFrame from the completed scan and push it to Tiled."""
+        if not PANDAS_AVAILABLE:
+            self._log_msg("🔴 Tiled: pandas not installed — cannot build table", PAL["nc"])
+            return
+
+        scan  = self._scan_instances[self._active_scan_idx]
+        x_lbl, _ = scan.plot_axes()
+        motor = x_lbl
+        det   = self._det_combo.currentText()
+
+        # _scan_positions and the y-values collected in _scan_plot are the
+        # canonical source of truth for the completed scan.
+        xs = [p["_x"] for p in self._scan_positions[: self._scan_idx]]
+        ys = list(self._scan_plot.ys)[: self._scan_idx]   # see note below
+
+        if not xs:
+            self._log_msg("🔴 Tiled: no scan data to write", PAL["nc"])
+            return
+
+        df = pd.DataFrame({motor: xs, det: ys})
+
+        general = self._app_cfg.get("general", {})
+        metadata = {
+            "scan_num":   self._scan_num.value(),
+            "motor":      motor,
+            "detector":   det,
+            "start":      xs[0],
+            "stop":       xs[-1],
+            "n_points":   len(xs),
+            "timestamp":  datetime.now().isoformat(),
+            "facility":   general.get("facility",   "ALS"),
+            "beamline":   general.get("beamline",   "BL601"),
+            "endstation": general.get("endstation", "HiRRIXS"),
+        }
+
+        ok, msg = self._tiled.write_scan(df, metadata)
+        if ok:
+            self._log_msg(f"🔵 Tiled: written → {msg}", PAL["ok"])
+        else:
+            self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
+
+    def _abort_scan(self):
+        self._scan_timer.stop()
+        self._acquiring = False
+        self._set_state(_ScanState.ABORTING)
+        if self._writer is not None:
+            self._writer.close(aborted=True); self._writer = None
+        self._log_msg("■ Scan aborted.", PAL["nc"])
+        self._scan_plot.finish("Scan aborted")
         self._reset_run_btns()
 
     def _reset_run_btns(self):
