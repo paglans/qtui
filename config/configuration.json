@@ -14,17 +14,17 @@
     "pva_provider": "pva"
   },
   "data_acquisition": {
-    "default_output_dir": "~/data",
+    "default_output_dir": "~/Data",
     "default_prefix": "scan",
     "filename_mode": "timestamp",
     "auto_increment": true,
     "default_format": "HDF5"
   },
   "tiled": {
-    "enabled":    true,
-    "host":       "localhost",
-    "port":       8000,
-    "container":  "amber"
+    "enabled": true,
+    "host": "localhost",
+    "port": 8000,
+    "container": "amber"
   },
   "ui": {
     "strip_chart_history_s": 300,

@@ -12,12 +12,13 @@
 			"DIAG101": "BL0601:DIAG101Pos",
 			"M102": "BL0601:M102Angle",
 			"G10x": "BL0601:G10xAngle",
-			"BeamlineEnergy": "BL0601:BeamlineEnergy",
+			"BeamlineEnergy": "BL6013:BeamlineEnergyUDP",
+			"MonoEnergy": "BL6013:MonoEnergyUDP",
 			"M131": {
 				"M131Pitch": "BL0601:M131Pitch",
 				"M131Roll": "BL0601:M131Roll"
 			},
-			"SLIT": "BL0601:SLIT131VertSize",
+			"SLIT": "BL6013:SLIT131VertSizeUDP",
 			"SHTR131": {
 				"SHTR131Pos": "BL0601:SHTR131Pos",
 				"SHTR131PZT": "BL0601:SHTR131PZT"
