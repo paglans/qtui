@@ -2,3 +2,6 @@ __pycache__
 beamline_gui.py
 README.txt
 test.py
+np
+threading
+time

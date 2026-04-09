@@ -20,4 +20,5 @@ torch                 # BoTorch / blop backend
 botorch
 
 # Data management
-tiled==0.2.2
+tiled==0.2.3
+fastapi==0.131.0
