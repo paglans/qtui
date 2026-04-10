@@ -48,6 +48,8 @@ from scan_types import (
         _AREA_LABELS, _AREA_COLORS,
     )
 
+from devices import all_device_map
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 SCAN_ACQ_TIMEOUT_S = 30.0   # max seconds to wait for area-detector acquire
 
@@ -439,6 +441,8 @@ class DAQTab(QWidget):
         self._scan_columns: list = []   # ordered extra channel names
         # active scan type (BaseScan instance, one per type kept alive)
         self._scan_instances = [ST() for ST in ALL_SCAN_TYPES]
+        self._device_map: dict = all_device_map(amber_cfg, hirrixs_cfg)
+        self._queue_tab = None   # set later via set_queue_tab()
         self._active_scan_idx = 0        # index into _scan_instances
  
         # area-detector state
@@ -778,6 +782,12 @@ class DAQTab(QWidget):
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(6)
         self._run_btn   = QPushButton("▶  Run");   self._run_btn.setStyleSheet(BTN_STYLE)
+        self._queue_btn = QPushButton("+ Queue")
+        self._queue_btn.setStyleSheet(BTN_STYLE)
+        self._queue_btn.setToolTip("Add current scan parameters to the queue server")
+        self._queue_btn.setEnabled(False)   # enabled once set_queue_tab() is called
+        self._queue_btn.clicked.connect(self._add_to_queue)
+        btn_row.addWidget(self._queue_btn)
         self._pause_btn = QPushButton("⏸  Pause"); self._pause_btn.setStyleSheet(BTN_STYLE)
         self._abort_btn = QPushButton("■  Abort"); self._abort_btn.setStyleSheet(BTN_STYLE)
         self._pause_btn.setEnabled(False); self._abort_btn.setEnabled(False)
@@ -886,6 +896,79 @@ class DAQTab(QWidget):
                 PAL["warn"])
         else:
             self._fmt_combo.setEnabled(True)
+
+    def set_queue_tab(self, qt) -> None:
+        """Wire in the QueueTab so the DAQ tab can submit plans."""
+        self._queue_tab = qt
+        self._queue_btn.setEnabled(True)
+        self._log_msg("Queue server tab connected.", PAL["subtext"])
+
+    def _add_to_queue(self) -> None:
+        """Translate current scan parameters into a bluesky plan and submit."""
+        if self._queue_tab is None:
+            self._log_msg("⚠ Queue tab not connected.", PAL["nc"])
+            return
+
+        scan = self._scan_instances[self._active_scan_idx]
+        det  = self._det_combo.currentText()
+
+        # ── Resolve device names ───────────────────────────────────────────────
+        det_dev = self._device_map.get(det)
+        if det_dev is None:
+            self._log_msg(
+                f"⚠ No device name found for detector '{det}'. "
+                f"Check devices.py / startup script.", PAL["nc"])
+            return
+
+        # For 1D and Time scans the "motor" is the inner (or only) motor.
+        # For 2D it's the inner motor (plot axis).
+        x_lbl, _ = scan.plot_axes()
+        # x_lbl is the motor friendly name for 1D/2D; "Time (s)" for TimeScan.
+        motor_dev = self._device_map.get(x_lbl, "")
+
+        # ── Build plan tuple ───────────────────────────────────────────────────
+        try:
+            plan_name, args, kwargs = scan.to_plan(motor_dev, det_dev)
+        except Exception as exc:
+            self._log_msg(f"⚠ Could not build plan: {exc}", PAL["nc"])
+            return
+
+        # ── Resolve the Scan2D outer motor sentinel ───────────────────────────
+        # Scan2D encodes the outer motor as "__outer__:<friendly_name>" in args
+        # so this method can look it up without coupling scan_types to devices.
+        resolved_args = []
+        for a in args:
+            if isinstance(a, str) and a.startswith("__outer__:"):
+                outer_friendly = a[len("__outer__:"):]
+                outer_dev = self._device_map.get(outer_friendly)
+                if outer_dev is None:
+                    self._log_msg(
+                        f"⚠ No device name for outer motor '{outer_friendly}'.",
+                        PAL["nc"])
+                    return
+                resolved_args.append(outer_dev)
+            else:
+                resolved_args.append(a)
+
+        # ── Build metadata ────────────────────────────────────────────────────
+        meta = dict(
+            scan_type  = scan.LABEL,
+            detector   = det,
+            det_kind   = self._det_kind,
+            scan_label = scan.scan_label(),
+            output_dir = self._dir_edit.text().strip(),
+            prefix     = self._prefix_edit.text().strip() or "scan",
+            scan_num   = self._scan_num.value(),
+            exposure   = self._p_exp.value(),
+        )
+
+        # ── Submit ────────────────────────────────────────────────────────────
+        ok = self._queue_tab.add_plan(plan_name, resolved_args, kwargs, meta)
+        if ok:
+            self._log_msg(
+                f"✔ Added to queue: {scan.scan_label()}", PAL["ok"])
+        # On failure, add_plan() already logs the error in the Queue tab.
+
 
     # ── Scan engine ───────────────────────────────────────────────────────────
     def _start_scan(self):

@@ -8,6 +8,7 @@ ophyd
 
 # Bluesky stack (required for BLOP tab)
 bluesky
+bluesky-queueserver-api
 databroker
 blop                  # pip install blop  OR  conda install -c conda-forge blop
 

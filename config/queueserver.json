@@ -1,0 +1,13 @@
+{
+  "queueserver": {
+    "http_host":        "localhost",
+    "http_port":        60610,
+    "http_api_key":     "test",
+    "zmq_control":      "tcp://localhost:60615",
+    "zmq_info":         "tcp://localhost:60625",
+    "startup_dir":      "/home/anders/bluesky/startup",
+    "env_name":         "bluesky",
+    "autoconnect":      true,
+    "poll_interval_s":  2.0
+  }
+}

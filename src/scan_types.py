@@ -125,6 +125,22 @@ class BaseScan(ABC):
         """Outer motor name; None if not a 2-D scan."""
         return None
 
+    @abstractmethod
+    def to_plan(self, motor_dev: str, det_dev: str) -> "tuple[str, list, dict]":
+        """Return (plan_name, args, kwargs) for queue server submission.
+
+        Parameters
+        ----------
+        motor_dev : ophyd device name of the scan motor (string identifier
+                    that exists in the RE Manager worker namespace).
+        det_dev   : ophyd device name of the detector / signal.
+
+        Returns
+        -------
+        plan_name : str    e.g. "scan", "grid_scan", "count"
+        args      : list   positional arguments
+        kwargs    : dict   keyword arguments
+        """
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1-D Scan
@@ -198,6 +214,15 @@ class Scan1D(BaseScan):
                 f"  {p['steps']} pts"
                 + ("  (relative)" if p["relative"] else ""))
 
+    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
+        if self._widget is None:
+            raise RuntimeError("Scan1D widget not built yet")
+        p = self._widget.params()
+        return (
+            "scan",
+            [[det_dev], motor_dev, p["start"], p["stop"]],
+            {"num": p["steps"]},
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2-D Scan
@@ -307,6 +332,30 @@ class Scan2D(BaseScan):
                 f"  {'snake' if p['snake'] else 'raster'}"
                 + ("  (relative)" if p["relative"] else ""))
 
+    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
+        """motor_dev here is the *inner* motor (matches plot_axes convention).
+        The outer motor device name is looked up from the widget directly.
+        Caller must pass the inner motor dev name; outer is read internally.
+        """
+        if self._widget is None:
+            raise RuntimeError("Scan2D widget not built yet")
+        p  = self._widget.params()
+        o  = p["outer"]
+        i_ = p["inner"]
+        # The caller supplies inner motor dev; outer is derived the same way
+        # by DAQTab using all_device_map[outer_motor_name].
+        # We encode outer motor name as a placeholder — DAQTab resolves it.
+        return (
+            "grid_scan",
+            [
+                [det_dev],
+                f"__outer__:{o['motor']}",   # sentinel resolved by DAQTab
+                o["start"], o["stop"], o["steps"],
+                motor_dev,
+                i_["start"], i_["stop"], i_["steps"],
+            ],
+            {"snake_axes": p["snake"]},
+        )
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Time Scan
@@ -370,6 +419,16 @@ class TimeScan(BaseScan):
         return (f"Time  {p['duration']:.1f} s  @  "
                 f"{p['interval']:.2f} s/pt  ({p['n_pts']} pts)")
 
+    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
+        # motor_dev is unused for time scans — no motor to move
+        if self._widget is None:
+            raise RuntimeError("TimeScan widget not built yet")
+        p = self._widget.params()
+        return (
+            "count",
+            [[det_dev]],
+            {"num": p["n_pts"], "delay": p["interval"]},
+        )
 
 # ── Registry ──────────────────────────────────────────────────────────────────
 ALL_SCAN_TYPES: list[type[BaseScan]] = [Scan1D, Scan2D, TimeScan]

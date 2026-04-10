@@ -26,6 +26,7 @@ from common import PAL, load_json
 from beamline_tab import BeamlineTab
 from endstation_tab import EndstationTab
 from daq_tab import DAQTab
+from queue_tab import QueueTab
 from blop_tab import BLOPTab
 from configuration_tab import ConfigurationTab
 
@@ -40,6 +41,7 @@ class MainWindow(QMainWindow):
         base = Path(__file__).parent.parent / "config"
         amber_cfg   = load_json(base / "amber.json").get("amber", {})
         hirrixs_cfg = load_json(base / "hirrixs.json").get("hirrixs", {})
+        qs_cfg = load_json(base / "queueserver.json").get("queueserver", {})
 
         all_signals: dict = {}
         for n, p in amber_cfg.get("signal", {}).items():   all_signals[n] = p
@@ -75,11 +77,14 @@ class MainWindow(QMainWindow):
         config_tab     = ConfigurationTab()
         app_cfg        = load_json(base / "configuration.json")
         daq_tab        = DAQTab(amber_cfg, hirrixs_cfg, config_tab=config_tab, app_cfg=app_cfg)
+        queue_tab      = QueueTab(qs_cfg)
+        daq_tab.set_queue_tab(queue_tab)
         blop_tab       = BLOPTab(amber_cfg, hirrixs_cfg)
 
         tabs.addTab(beamline_tab,   "🔬  AMBER Beamline")
         tabs.addTab(endstation_tab, "⚗️  HiRRIXS Endstation")
         tabs.addTab(daq_tab,        "💾  Data Acquisition")
+        tabs.addTab(queue_tab,      "🗂  Queue Server")
         tabs.addTab(blop_tab,       "🤖  BLOP")
         tabs.addTab(config_tab,     "⚙️  Configuration")
 
