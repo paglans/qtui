@@ -65,11 +65,11 @@ _IND_BASE = ("width:12px; height:12px; border-radius:6px; border:1px solid #555;
 
 # RE/environment state → colour
 _ENV_COLORS = {
-    "opened":  PAL["ok"],
+    "idle":    PAL["ok"],    # environment exists and is ready
     "opening": PAL["warn"],
-    "closed":  PAL["nc"],
     "closing": PAL["warn"],
     "failed":  PAL["nc"],
+    "closed":  PAL["nc"],
 }
 _RE_COLORS = {
     "idle":     PAL["ok"],
@@ -224,6 +224,7 @@ class QueueTab(QWidget):
         self._cfg      = qs_cfg
         self._poller   = None
         self._connected = False
+        self._env_exists = False
         # UIDs for the current queue items (parallel to table rows)
         self._queue_uids: list[str] = []
 
@@ -293,8 +294,8 @@ class QueueTab(QWidget):
 
         hl.addWidget(_vline())
 
-        # Worker pid
-        hl.addWidget(_sub("Worker:"))
+        # Queue counts (replaces missing worker_pid)
+        hl.addWidget(_sub("Queue:"))
         self._lbl_worker = QLabel("–")
         self._lbl_worker.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt; font-family:monospace;")
         hl.addWidget(self._lbl_worker)
@@ -456,6 +457,7 @@ class QueueTab(QWidget):
         self._lbl_conn.setStyleSheet(f"color:{col}; font-size:8pt;")
         self._env_btn.setEnabled(ok)
         if not ok:
+            self._env_exists = False
             for b in (self._start_btn, self._stop_btn, self._pause_btn,
                       self._resume_btn, self._abort_btn,
                       self._up_btn, self._dn_btn, self._rm_btn, self._clr_btn):
@@ -465,30 +467,35 @@ class QueueTab(QWidget):
             self._lbl_worker.setText("–")
 
     def _on_status(self, s: dict):
-        env   = s.get("worker_environment_state", "unknown")
-        re    = s.get("re_state", "unknown")
-        pid   = s.get("worker_pid")
+        env_exists = s.get("worker_environment_exists", False)
+        env_state  = s.get("worker_environment_state", "unknown")
+        re         = s.get("re_state", "unknown")
+        mgr        = s.get("manager_state", "unknown")
 
-        env_col = _ENV_COLORS.get(env, PAL["subtext"])
-        re_col  = _RE_COLORS.get(re,  PAL["subtext"])
-        self._lbl_env.setText(env)
+        self._env_exists = env_exists   # keep in sync for _toggle_env
+
+        env_col = PAL["ok"] if env_exists and env_state == "idle" else \
+                  _ENV_COLORS.get(env_state, PAL["subtext"])
+        self._lbl_env.setText(env_state + (" ✓" if env_exists else " ✗"))
         self._lbl_env.setStyleSheet(
             f"color:{env_col}; font-size:8pt; font-family:monospace;")
+
+        re_col = _RE_COLORS.get(re, PAL["subtext"])
         self._lbl_re.setText(re)
         self._lbl_re.setStyleSheet(
             f"color:{re_col}; font-size:8pt; font-family:monospace;")
-        self._lbl_worker.setText(str(pid) if pid else "–")
 
-        # Env button label
-        self._env_btn.setText(
-            "Close Env" if env == "opened" else "Open Env")
+        self._lbl_worker.setText(f"{s.get('items_in_queue', 0)} queued / "
+                                  f"{s.get('items_in_history', 0)} done")
 
-        # RE control buttons — enable based on state
-        env_open = (env == "opened")
-        is_idle   = (re == "idle")
-        is_paused = (re == "paused")
-        is_running = (re == "running")
-        queue_running = s.get("manager_state", "") == "executing_queue"
+        self._env_btn.setText("Close Env" if env_exists else "Open Env")
+        self._env_btn.setEnabled(self._connected)
+
+        env_open      = env_exists and env_state == "idle"
+        is_idle       = (re == "idle")
+        is_paused     = (re == "paused")
+        is_running    = (re == "running")
+        queue_running = (mgr == "executing_queue")
 
         self._start_btn.setEnabled(env_open and is_idle)
         self._stop_btn.setEnabled(env_open and queue_running)
@@ -567,8 +574,7 @@ class QueueTab(QWidget):
         self._log(f"[{_ts()}] re_abort → {_result_str(r)}", PAL["nc"])
 
     def _toggle_env(self):
-        env = self._lbl_env.text()
-        if env == "opened":
+        if self._env_exists:
             r = self._api("environment_close")
             self._log(f"[{_ts()}] environment_close → {_result_str(r)}", PAL["warn"])
         else:

@@ -218,10 +218,12 @@ class Scan1D(BaseScan):
         if self._widget is None:
             raise RuntimeError("Scan1D widget not built yet")
         p = self._widget.params()
+        # num must be positional — the worker's custom scan plan takes
+        # (detectors, motor, start, stop, num) all as positional args
         return (
             "scan",
-            [[det_dev], motor_dev, p["start"], p["stop"]],
-            {"num": p["steps"]},
+            [[det_dev], motor_dev, p["start"], p["stop"], p["steps"]],
+            {},
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -331,7 +333,7 @@ class Scan2D(BaseScan):
                 f" = {n_tot} total"
                 f"  {'snake' if p['snake'] else 'raster'}"
                 + ("  (relative)" if p["relative"] else ""))
-
+ 
     def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
         """motor_dev here is the *inner* motor (matches plot_axes convention).
         The outer motor device name is looked up from the widget directly.
@@ -342,19 +344,18 @@ class Scan2D(BaseScan):
         p  = self._widget.params()
         o  = p["outer"]
         i_ = p["inner"]
-        # The caller supplies inner motor dev; outer is derived the same way
-        # by DAQTab using all_device_map[outer_motor_name].
-        # We encode outer motor name as a placeholder — DAQTab resolves it.
         return (
             "grid_scan",
             [
                 [det_dev],
-                f"__outer__:{o['motor']}",   # sentinel resolved by DAQTab
-                o["start"], o["stop"], o["steps"],
+                f"__outer__:{o['motor']}",   # resolved by DAQTab
                 motor_dev,
-                i_["start"], i_["stop"], i_["steps"],
+                o["start"], i_["start"],
+                o["stop"],  i_["stop"],
+                o["steps"], i_["steps"],
+                p["snake"],
             ],
-            {"snake_axes": p["snake"]},
+            {},
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
