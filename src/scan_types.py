@@ -124,22 +124,16 @@ class BaseScan(ABC):
     def outer_motor(self) -> "str | None":
         """Outer motor name; None if not a 2-D scan."""
         return None
-
     @abstractmethod
-    def to_plan(self, motor_dev: str, det_dev: str) -> "tuple[str, list, dict]":
+    def to_plan(self, motor_dev: str, det_dev: str,
+                exposure_time: float = 1.0) -> "tuple[str, list, dict]":
         """Return (plan_name, args, kwargs) for queue server submission.
 
         Parameters
         ----------
-        motor_dev : ophyd device name of the scan motor (string identifier
-                    that exists in the RE Manager worker namespace).
-        det_dev   : ophyd device name of the detector / signal.
-
-        Returns
-        -------
-        plan_name : str    e.g. "scan", "grid_scan", "count"
-        args      : list   positional arguments
-        kwargs    : dict   keyword arguments
+        motor_dev     : ophyd device name of the scan motor
+        det_dev       : ophyd device name of the detector
+        exposure_time : integration time per point in seconds
         """
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -214,16 +208,15 @@ class Scan1D(BaseScan):
                 f"  {p['steps']} pts"
                 + ("  (relative)" if p["relative"] else ""))
 
-    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
+    def to_plan(self, motor_dev: str, det_dev: str,
+                exposure_time: float = 1.0) -> tuple[str, list, dict]:
         if self._widget is None:
             raise RuntimeError("Scan1D widget not built yet")
         p = self._widget.params()
-        # num must be positional — the worker's custom scan plan takes
-        # (detectors, motor, start, stop, num) all as positional args
         return (
             "scan",
             [[det_dev], motor_dev, p["start"], p["stop"], p["steps"]],
-            {},
+            {"exposure_time": exposure_time},
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -334,11 +327,8 @@ class Scan2D(BaseScan):
                 f"  {'snake' if p['snake'] else 'raster'}"
                 + ("  (relative)" if p["relative"] else ""))
  
-    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
-        """motor_dev here is the *inner* motor (matches plot_axes convention).
-        The outer motor device name is looked up from the widget directly.
-        Caller must pass the inner motor dev name; outer is read internally.
-        """
+    def to_plan(self, motor_dev: str, det_dev: str,
+                exposure_time: float = 1.0) -> tuple[str, list, dict]:
         if self._widget is None:
             raise RuntimeError("Scan2D widget not built yet")
         p  = self._widget.params()
@@ -348,14 +338,14 @@ class Scan2D(BaseScan):
             "grid_scan",
             [
                 [det_dev],
-                f"__outer__:{o['motor']}",   # resolved by DAQTab
+                f"__outer__:{o['motor']}",   # sentinel resolved by DAQTab
                 motor_dev,
                 o["start"], i_["start"],
                 o["stop"],  i_["stop"],
                 o["steps"], i_["steps"],
                 p["snake"],
             ],
-            {},
+            {"exposure_time": exposure_time},
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -420,15 +410,18 @@ class TimeScan(BaseScan):
         return (f"Time  {p['duration']:.1f} s  @  "
                 f"{p['interval']:.2f} s/pt  ({p['n_pts']} pts)")
 
-    def to_plan(self, motor_dev: str, det_dev: str) -> tuple[str, list, dict]:
-        # motor_dev is unused for time scans — no motor to move
+    def to_plan(self, motor_dev: str, det_dev: str,
+                exposure_time: float = 1.0) -> tuple[str, list, dict]:
         if self._widget is None:
             raise RuntimeError("TimeScan widget not built yet")
         p = self._widget.params()
+        # For time scans the bluesky delay between points should be at least
+        # the exposure time — warn if delay < exposure
+        delay = max(p["interval"], exposure_time)
         return (
             "count",
-            [[det_dev]],
-            {"num": p["n_pts"], "delay": p["interval"]},
+            [[det_dev], p["n_pts"]],
+            {"delay": delay, "exposure_time": exposure_time},
         )
 
 # ── Registry ──────────────────────────────────────────────────────────────────

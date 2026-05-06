@@ -116,14 +116,18 @@ class _QSPoller(QThread):
     history_updated = Signal(list)   # list of completed-plan dicts
     log_message     = Signal(str, str)  # (message, colour)
     connected       = Signal(bool)   # True = server reachable
+    # Emitted when the running item changes.
+    # Payload: full item dict while a scan is executing, {} when idle.
+    running_item_changed = Signal(dict)
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self._cfg      = cfg
-        self._rm       = None          # REManagerAPI instance
+        self._rm       = None
         self._running  = True
         self._mutex    = QMutex()
-        self._last_connected = None
+        self._last_connected   = None
+        self._last_running_uid = ""    # track UID to emit running_item_changed only on change
 
     # ── Public control ────────────────────────────────────────────────────────
 
@@ -182,7 +186,14 @@ class _QSPoller(QThread):
                          else f"Queue server unreachable at {uri}"
                 self.log_message.emit(f"[{_ts()}] {msg}", colour)
 
-            time.sleep(interval)
+            # Sleep in 100 ms increments so stop() is responsive
+            slept = 0.0
+            while slept < interval:
+                with QMutexLocker(self._mutex):
+                    if not self._running:
+                        return
+                time.sleep(0.1)
+                slept += 0.1
 
     def _poll_once(self) -> bool:
         if self._rm is None:
@@ -194,6 +205,16 @@ class _QSPoller(QThread):
             self.status_updated.emit(status)
             self.queue_updated.emit(q.get("items", []))
             self.history_updated.emit(history.get("items", []))
+
+            # Detect running-item changes.
+            # running_item is a field in the queue_get() response (not status()).
+            # It contains the full item dict while executing, or {} when idle.
+            running_item: dict = q.get("running_item") or {}
+            uid: str = running_item.get("item_uid", "")
+            if uid != self._last_running_uid:
+                self._last_running_uid = uid
+                self.running_item_changed.emit(running_item)
+
             return True
         except Exception:
             return False
@@ -217,7 +238,15 @@ class QueueTab(QWidget):
                 Event log      (bottom)
     ─────────────────────────────────────
     RE control bar
+
+    Public signals
+    ──────────────
+    running_item_changed(dict)
+        Forwarded from _QSPoller.  Full item dict when executing, {} when idle.
+        Connect from DAQTab via set_queue_tab().
     """
+
+    running_item_changed = Signal(dict)
 
     def __init__(self, qs_cfg: dict, parent=None):
         super().__init__(parent)
@@ -429,8 +458,18 @@ class QueueTab(QWidget):
         self._poller.history_updated.connect(self._on_history)
         self._poller.log_message.connect(self._log)
         self._poller.connected.connect(self._on_connected)
+        self._poller.running_item_changed.connect(self.running_item_changed)
         self._poller.start()
         self._conn_btn.setText("Disconnect")
+        # Ensure clean thread shutdown on app exit regardless of widget
+        # lifecycle — closeEvent on a child widget is not reliable.
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            try:
+                app.aboutToQuit.connect(self._stop_poller, Qt.UniqueConnection)
+            except Exception:
+                pass
 
     def _stop_poller(self):
         if self._poller:

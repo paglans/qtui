@@ -122,7 +122,7 @@ class DetectorTable(QTableWidget):
         self.setAlternatingRowColors(False)
         self._row_map: dict = {}   # pv → row index
         self._populate()
-        PVMonitor().value_changed.connect(self._on_pv)
+        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
 
     def _populate(self):
         for name, pv in self._det_pvs.items():
@@ -459,6 +459,34 @@ class DAQTab(QWidget):
             self._det_pvs[n]  = p + ":Acquire_RBV" # CA readback PV
         self._scan_idx = 0; self._scan_positions: list = []
         self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
+
+        # ── Queue-server live-display state ───────────────────────────────────
+        self._qs_elapsed_timer = QTimer(self)
+        self._qs_elapsed_timer.setInterval(1000)
+        self._qs_elapsed_timer.timeout.connect(self._qs_update_elapsed)
+        self._qs_motor_pv  = ""
+        self._qs_det_pv    = ""
+        self._qs_n_steps   = 0
+        self._qs_t0        = 0.0
+        self._qs_last_x    = None
+        self._qs_active    = False
+        self._qs_pending: dict = {}
+
+        # ── Queue-server live-display state ───────────────────────────────────
+        # Data points are driven by EPICS PV callbacks (value_changed signal),
+        # not a polling timer, so every motor step is captured.
+        # A separate 1 Hz timer updates only the elapsed-time label.
+        self._qs_elapsed_timer = QTimer(self)
+        self._qs_elapsed_timer.setInterval(1000)
+        self._qs_elapsed_timer.timeout.connect(self._qs_update_elapsed)
+        self._qs_motor_pv  = ""
+        self._qs_det_pv    = ""
+        self._qs_n_steps   = 0
+        self._qs_t0        = 0.0
+        self._qs_last_x    = None    # last recorded motor position (float or None)
+        self._qs_active    = False   # True while a QS scan is being displayed
+        # Pending info set at _add_to_queue time so the callback can arm early
+        self._qs_pending: dict = {}  # {motor_pv, det_pv, motor_lbl, det_lbl, n_steps, plan_name}
 
         # Build motor / signal / detector dicts from configs
         self._motor_pvs  = self._collect_pvs(amber_cfg,   "motor")
@@ -898,10 +926,310 @@ class DAQTab(QWidget):
             self._fmt_combo.setEnabled(True)
 
     def set_queue_tab(self, qt) -> None:
-        """Wire in the QueueTab so the DAQ tab can submit plans."""
+        """Wire in the QueueTab for plan submission and live scan display."""
         self._queue_tab = qt
         self._queue_btn.setEnabled(True)
+        qt.running_item_changed.connect(self._on_qs_running_item)
         self._log_msg("Queue server tab connected.", PAL["subtext"])
+
+    # ── Queue-server live display ─────────────────────────────────────────────
+
+    def _qs_arm(self, motor_pv: str, det_pv: str,
+                motor_lbl: str, det_lbl: str,
+                n_steps: int, plan_name: str) -> None:
+        """Subscribe PVs and connect the motor callback so data collection
+        starts immediately — called both from _add_to_queue (before the scan
+        starts) and from _on_qs_running_item (safety net if we missed arm).
+        Safe to call multiple times; connect is a no-op if already connected.
+        """
+        if motor_pv:
+            PVMonitor().subscribe(motor_pv)
+        if det_pv:
+            PVMonitor().subscribe(det_pv)
+
+        self._qs_motor_pv = motor_pv
+        self._qs_det_pv   = det_pv
+        self._qs_n_steps  = n_steps
+        self._qs_last_x   = None   # always reset — prevents initial subscription
+                                   # value from blocking the first scan point
+
+        if not self._qs_active:
+            self._qs_active = True
+            self._qs_t0     = time.monotonic()
+            self._scan_plot.reset(motor_lbl, det_lbl,
+                                  f"QServer: {plan_name}  (waiting…)")
+            self._progress.setMaximum(n_steps if n_steps else 0)
+            self._progress.setValue(0)
+            self._set_state(_ScanState.RUNNING)
+            self._st_file.setText(f"{plan_name} · pending")
+            self._st_file.setStyleSheet(
+                f"color:{PAL['accent']}; font-family:monospace; font-size:8pt;")
+            self._st_point.setText("0" + (f" / {n_steps}" if n_steps else ""))
+            self._st_elapsed.setText("0.0 s")
+            # Disconnect first (in case of stale connection), then reconnect once.
+            try:
+                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
+            except RuntimeError:
+                pass
+            PVMonitor().value_changed.connect(
+                self._on_qs_motor_callback, Qt.UniqueConnection)
+            self._qs_elapsed_timer.start()
+
+    def _on_qs_running_item(self, item: dict) -> None:
+        """Called when the queue server starts or finishes a scan.
+
+        item = full running-item dict when executing, {} when idle/done.
+        """
+        # ── Scan ended ────────────────────────────────────────────────────────
+        if not item:
+            # Always disconnect — don't gate on _qs_active — so stale
+            # connections from _qs_arm never accumulate across scans.
+            try:
+                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
+            except RuntimeError:
+                pass
+            if self._qs_active:
+                self._qs_active = False
+                self._qs_elapsed_timer.stop()
+                elapsed = time.monotonic() - self._qs_t0
+                self._scan_plot.finish("QServer scan complete")
+                self._log_msg(
+                    f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
+                self._write_qs_file()
+                self._set_state(_ScanState.IDLE)
+                self._st_file.setText("—")
+                self._st_file.setStyleSheet(
+                    f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
+                self._qs_pending = {}
+                if self._auto_inc.isChecked():
+                    self._scan_num.setValue(self._scan_num.value() + 1)
+            return
+
+        # ── Scan running — update plot title with real UID ────────────────────
+        plan      = item.get("name", "?")
+        args      = item.get("args", [])
+        uid_short = item.get("item_uid", "")[:8]
+
+        self._log_msg(
+            f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
+
+        # If _qs_arm was already called from _add_to_queue, the callback is live
+        # and data is already flowing.  Update the plot title, reset the
+        # deduplication threshold, and immediately record the current motor
+        # position as the first point (catches the case where the motor was
+        # already at the start position and no callback fired).
+        if self._qs_active:
+            self._scan_plot._ax.set_title(
+                f"QServer: {plan}  (…{uid_short})",
+                color=PAL["text"], fontsize=9)
+            if hasattr(self._scan_plot, "_canvas"):
+                self._scan_plot._canvas.draw_idle()
+            self._st_file.setText(f"{plan} · …{uid_short}")
+            # Reset deduplication so the first callback after this is always recorded
+            self._qs_last_x = None
+            # Immediately sample current motor + detector position
+            self._qs_record_now()
+            return
+
+        # Safety net: _add_to_queue was not the trigger (e.g. scan queued from
+        # another client).  Resolve PVs from the item args and arm now.
+        inv_map = {v: k for k, v in self._device_map.items()}
+
+        def _resolve(devname):
+            friendly = inv_map.get(str(devname), str(devname))
+            pv = (self._motor_pvs.get(friendly)
+                  or self._signal_pvs.get(friendly)
+                  or self._det_pvs.get(friendly)
+                  or "")
+            return friendly, pv
+
+        det_arg   = args[0] if args else ""
+        if isinstance(det_arg, list):
+            det_arg = det_arg[0] if det_arg else ""
+        motor_arg = args[1] if len(args) > 1 else ""
+        n_steps   = int(args[4]) if len(args) > 4 else 0
+
+        motor_lbl, motor_pv = _resolve(motor_arg)
+        det_lbl,   det_pv   = _resolve(det_arg)
+
+        if not motor_pv:
+            motor_lbl = self._motor_combo.currentText()
+            motor_pv  = self._motor_pvs.get(motor_lbl, "")
+            self._log_msg(
+                f"  ⚠ Motor {motor_arg!r} not resolved → {motor_lbl!r}", PAL["warn"])
+        if not det_pv:
+            det_lbl = self._det_combo.currentText()
+            det_pv  = ({**self._signal_pvs, **self._det_pvs}).get(det_lbl, "")
+            self._log_msg(
+                f"  ⚠ Detector {det_arg!r} not resolved → {det_lbl!r}", PAL["warn"])
+
+        self._log_msg(
+            f"  Motor PV: {motor_pv!r}   Detector PV: {det_pv!r}   n_steps={n_steps}",
+            PAL["subtext"])
+
+        self._qs_arm(motor_pv, det_pv, motor_lbl, det_lbl, n_steps, plan)
+        # Update title now we have the UID
+        self._scan_plot._ax.set_title(
+            f"QServer: {plan}  (…{uid_short})", color=PAL["text"], fontsize=9)
+        if hasattr(self._scan_plot, "_canvas"):
+            self._scan_plot._canvas.draw_idle()
+        self._st_file.setText(f"{plan} · …{uid_short}")
+
+    def _on_qs_motor_callback(self, pv_name: str, value) -> None:
+        """Fires on every PVMonitor value_changed event while a QS scan is active.
+
+        Records one (x, y) point each time the motor arrives at a new position.
+        """
+        if not self._qs_active:
+            return
+        if pv_name != self._qs_motor_pv:
+            return
+        if value is None:
+            return
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return
+
+        # Deduplicate: only record when the motor has moved by more than a small
+        # threshold (absorbs settling noise and repeated callbacks at same setpoint).
+        if self._qs_last_x is not None and abs(x - self._qs_last_x) < 1e-6:
+            return
+        self._qs_last_x = x
+
+        # Read detector at this instant
+        if EPICS_AVAILABLE and self._qs_det_pv:
+            raw = PVMonitor().get(self._qs_det_pv)
+            y = float(raw) if raw is not None else float("nan")
+        else:
+            y = sim_scalar([{"_x": x}], len(self._scan_plot._xs))
+
+        self._scan_plot.add_point(x, y)
+
+        n_pts = len(self._scan_plot._xs)
+        n     = self._qs_n_steps
+        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
+        if n:
+            self._progress.setValue(min(n_pts, n))
+
+    def _qs_update_elapsed(self) -> None:
+        """Update the elapsed-time label once per second."""
+        if self._qs_active:
+            self._st_elapsed.setText(f"{time.monotonic() - self._qs_t0:.1f} s")
+
+    def _write_qs_file(self) -> None:
+        """Write the completed QS scan data to a local file.
+
+        Uses the same directory, prefix, format, and scan-number settings
+        as local scans.  The filename gets a 'qs_' prefix so QS-originated
+        files are distinguishable from locally-triggered ones.
+        """
+        xs = list(self._scan_plot._xs)
+        ys = list(self._scan_plot.ys)
+        if not xs:
+            self._log_msg("⚠ QS file: no data points collected — skipping write.",
+                          PAL["warn"])
+            return
+
+        # Build filename — same logic as _current_filename but with 'qs_' prefix
+        d      = self._dir_edit.text().strip() or "."
+        prefix = (self._prefix_edit.text().strip() or "scan") + "_qs"
+        ext    = {0: ".h5", 1: ".csv", 2: ".dat"}.get(
+            self._fmt_combo.currentIndex(), ".csv")
+        if self._rb_ts.isChecked():
+            suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        else:
+            suffix = f"{self._scan_num.value():04d}"
+        fname = f"{d}/{prefix}_{suffix}{ext}"
+
+        # Motor and detector labels — use whatever the plot axes were set to
+        motor_lbl = self._scan_plot._ax.get_xlabel() or self._qs_motor_pv or "motor"
+        det_lbl   = self._scan_plot._ax.get_ylabel() or self._qs_det_pv   or "detector"
+
+        meta = dict(
+            motor         = motor_lbl,
+            detector      = det_lbl,
+            n_points      = len(xs),
+            start         = xs[0]  if xs else 0,
+            stop          = xs[-1] if xs else 0,
+            scan_num      = self._scan_num.value(),
+            prefix        = prefix,
+            scan_type     = "QServer",
+            det_kind      = self._det_kind,
+            exposure_time = self._p_exp.value(),
+            source        = "bluesky-queueserver",
+        )
+
+        writer = ScanFileWriter()
+        if not writer.open(fname, meta, [det_lbl]):
+            self._log_msg(f"⚠ QS file: could not open {fname}", PAL["nc"])
+            return
+
+        for x, y in zip(xs, ys):
+            writer.write_point(x, y, {det_lbl: y})
+        writer.close()
+
+        self._log_msg(f"💾 QS file written → {fname}", PAL["ok"])
+        self._st_file.setText(Path(fname).name)
+        self._st_file.setStyleSheet(
+            f"color:{PAL['ok']}; font-family:monospace; font-size:8pt;")
+
+        # Also push to Tiled if enabled
+        if self._tiled_chk.isChecked() and PANDAS_AVAILABLE:
+            import pandas as pd
+            df = pd.DataFrame({motor_lbl: xs, det_lbl: ys})
+            general = self._app_cfg.get("general", {})
+            tiled_meta = {
+                **meta,
+                "timestamp":  datetime.now().isoformat(),
+                "facility":   general.get("facility",   "ALS"),
+                "beamline":   general.get("beamline",   "BL601"),
+                "endstation": general.get("endstation", "HiRRIXS"),
+            }
+            ok, msg = self._tiled.write_scan(df, tiled_meta)
+            if ok:
+                self._log_msg(f"🔵 Tiled: written → {msg}", PAL["ok"])
+            else:
+                self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
+
+    def _qs_record_now(self) -> None:
+        """Immediately sample the motor and detector PVs and record a point.
+
+        Called at scan-start confirmation to capture the first position, which
+        may not generate a motor callback if the motor was already there.
+        """
+        if not self._qs_active or not self._qs_motor_pv:
+            return
+        if EPICS_AVAILABLE:
+            raw_x = PVMonitor().get(self._qs_motor_pv)
+            x = float(raw_x) if raw_x is not None else None
+        else:
+            scan      = self._scan_instances[self._active_scan_idx]
+            positions = scan.build_positions()
+            x = positions[0].get("_x") if positions else None
+
+        if x is None:
+            return
+
+        # Use the same deduplication as the callback — _qs_last_x was just
+        # reset to None so this will always pass.
+        if self._qs_last_x is not None and abs(x - self._qs_last_x) < 1e-6:
+            return
+        self._qs_last_x = x
+
+        if EPICS_AVAILABLE and self._qs_det_pv:
+            raw_y = PVMonitor().get(self._qs_det_pv)
+            y = float(raw_y) if raw_y is not None else float("nan")
+        else:
+            y = sim_scalar([{"_x": x}], len(self._scan_plot._xs))
+
+        self._scan_plot.add_point(x, y)
+        n_pts = len(self._scan_plot._xs)
+        n     = self._qs_n_steps
+        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
+        if n:
+            self._progress.setValue(min(n_pts, n))
+
 
     def _add_to_queue(self) -> None:
         """Translate current scan parameters into a bluesky plan and submit."""
@@ -909,8 +1237,9 @@ class DAQTab(QWidget):
             self._log_msg("⚠ Queue tab not connected.", PAL["nc"])
             return
 
-        scan = self._scan_instances[self._active_scan_idx]
-        det  = self._det_combo.currentText()
+        scan          = self._scan_instances[self._active_scan_idx]
+        det           = self._det_combo.currentText()
+        exposure_time = self._p_exp.value()
 
         # ── Resolve device names ───────────────────────────────────────────────
         det_dev = self._device_map.get(det)
@@ -920,22 +1249,18 @@ class DAQTab(QWidget):
                 f"Check devices.py / startup script.", PAL["nc"])
             return
 
-        # For 1D and Time scans the "motor" is the inner (or only) motor.
-        # For 2D it's the inner motor (plot axis).
         x_lbl, _ = scan.plot_axes()
-        # x_lbl is the motor friendly name for 1D/2D; "Time (s)" for TimeScan.
         motor_dev = self._device_map.get(x_lbl, "")
 
         # ── Build plan tuple ───────────────────────────────────────────────────
         try:
-            plan_name, args, kwargs = scan.to_plan(motor_dev, det_dev)
+            plan_name, args, kwargs = scan.to_plan(
+                motor_dev, det_dev, exposure_time=exposure_time)
         except Exception as exc:
             self._log_msg(f"⚠ Could not build plan: {exc}", PAL["nc"])
             return
 
-        # ── Resolve the Scan2D outer motor sentinel ───────────────────────────
-        # Scan2D encodes the outer motor as "__outer__:<friendly_name>" in args
-        # so this method can look it up without coupling scan_types to devices.
+        # ── Resolve Scan2D outer motor sentinel ───────────────────────────────
         resolved_args = []
         for a in args:
             if isinstance(a, str) and a.startswith("__outer__:"):
@@ -952,23 +1277,28 @@ class DAQTab(QWidget):
 
         # ── Build metadata ────────────────────────────────────────────────────
         meta = dict(
-            scan_type  = scan.LABEL,
-            detector   = det,
-            det_kind   = self._det_kind,
-            scan_label = scan.scan_label(),
-            output_dir = self._dir_edit.text().strip(),
-            prefix     = self._prefix_edit.text().strip() or "scan",
-            scan_num   = self._scan_num.value(),
-            exposure   = self._p_exp.value(),
+            scan_type     = scan.LABEL,
+            detector      = det,
+            det_kind      = self._det_kind,
+            scan_label    = scan.scan_label(),
+            output_dir    = self._dir_edit.text().strip(),
+            prefix        = self._prefix_edit.text().strip() or "scan",
+            scan_num      = self._scan_num.value(),
+            exposure_time = exposure_time,
         )
 
         # ── Submit ────────────────────────────────────────────────────────────
         ok = self._queue_tab.add_plan(plan_name, resolved_args, kwargs, meta)
         if ok:
             self._log_msg(
-                f"✔ Added to queue: {scan.scan_label()}", PAL["ok"])
-        # On failure, add_plan() already logs the error in the Queue tab.
-
+                f"✔ Added to queue: {scan.scan_label()}  "
+                f"({exposure_time:.2f} s/pt)", PAL["ok"])
+            # Arm the motor callback immediately so we don't miss early points
+            # when the queue server starts executing before our next poll cycle.
+            motor_pv = self._motor_pvs.get(x_lbl, "")
+            det_pv   = ({**self._signal_pvs, **self._det_pvs}).get(det, "")
+            n_steps  = len(scan.build_positions())
+            self._qs_arm(motor_pv, det_pv, x_lbl, det, n_steps, plan_name)
 
     # ── Scan engine ───────────────────────────────────────────────────────────
     def _start_scan(self):

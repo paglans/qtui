@@ -56,7 +56,7 @@ class LiveChart(QWidget):
             ph = QLabel("matplotlib not installed"); ph.setAlignment(Qt.AlignCenter)
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             vl.addWidget(ph)
-        PVMonitor().value_changed.connect(self._on_pv)
+        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
 
     def set_x_pv(self, pv): self._x_pv=pv; self._x_val=None; self._clear()
     def set_y_pv(self, pv): self._y_pv=pv; self._y_val=None; self._clear()
@@ -251,7 +251,7 @@ class DetectorImageViewer(QWidget):
         self._bridge = _PVABridge(self)
         self._bridge.new_frame.connect(self._on_frame)
         self._mon = PVMonitor()
-        self._mon.value_changed.connect(self._sync_acq_rbv)
+        self._mon.value_changed.connect(self._sync_acq_rbv, Qt.UniqueConnection)
 
         if PVA_AVAILABLE:
             self._pva_lbl.setText("PVA: ok")
@@ -433,7 +433,7 @@ class _PVOverlayWidget(QWidget):
         self._eff.setOpacity(0.35)
         self.setGraphicsEffect(self._eff)
 
-        PVMonitor().value_changed.connect(self._on_pv)
+        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
         PVMonitor().subscribe(rbv_pv)
         self._rbv_pv = rbv_pv
 

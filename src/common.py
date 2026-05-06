@@ -214,7 +214,7 @@ class PVLabel(QLabel):
         if not pv_name: return
         mon = PVMonitor()
         mon.subscribe(pv_name)
-        mon.value_changed.connect(self._on_value)
+        mon.value_changed.connect(self._on_value, Qt.UniqueConnection)
         self._nc_timer = QTimer(self)
         self._nc_timer.setSingleShot(True)
         self._nc_timer.timeout.connect(self._on_timeout)
@@ -224,7 +224,7 @@ class PVLabel(QLabel):
         if self.text() not in ("…", "N/A"):
             return                          # already got a value, nothing to do
         if self._retries < 5:
-            # re-subscribe and try again
+            # re-subscribe and try again — UniqueConnection means no duplicate
             self._retries += 1
             mon = PVMonitor()
             mon._pvs.pop(self._pv, None)    # remove stale entry so subscribe() runs again

@@ -175,7 +175,7 @@ class StripChart(QWidget):
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             root.addWidget(ph, 1)
 
-        PVMonitor().value_changed.connect(self._on_pv)
+        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
 
         # Coalescing redraw timer — redraws at configured rate, not on every PV update
         self._redraw_timer = QTimer(self)
@@ -385,7 +385,7 @@ class ScanWindow(QDialog):
 
         # ── PV monitor ────────────────────────────────────────────────────────
         self._mon = PVMonitor()
-        self._mon.value_changed.connect(self._on_pv)
+        self._mon.value_changed.connect(self._on_pv, Qt.UniqueConnection)
         for pv in list(motor_pvs.values()) + list(signal_pvs.values()):
             self._mon.subscribe(pv)
 
@@ -805,7 +805,7 @@ class BeamlineTab(QWidget):
                             });
                             return max || document.body.scrollWidth;
                         })()
-                    """, _cb)
+                    """, 0, _cb)
 
                 def _apply_zoom(self):
                     if self._content_w <= 0: return

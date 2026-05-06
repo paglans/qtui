@@ -14,6 +14,11 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
 )
 os.environ.setdefault("EPICS_CA_CONN_TMO",     "30.0")
 os.environ.setdefault("EPICS_CA_BEACON_PERIOD", "15.0")
+# Qt XCB screen geometry workaround for nvidia 580 / kernel 6.12:
+# the new driver's RandR CRTC reporting leaves Qt with zero screen geometry,
+# which causes popup windows (combo boxes, menus) to size themselves to 0×0.
+# QT_XCB_NO_XRANDR forces Qt to use the X11 root window size instead.
+os.environ.setdefault("QT_XCB_NO_XRANDR", "1")
 
 import sys
 from pathlib import Path
