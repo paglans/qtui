@@ -13,45 +13,23 @@ from PySide6.QtWidgets import (
     QGroupBox, QGridLayout, QLineEdit, QPushButton, QComboBox,
     QProgressBar, QScrollArea, QSizePolicy, QFrame, QCheckBox,
     QSpinBox, QDoubleSpinBox, QTableWidget, QTableWidgetItem,
-    QHeaderView, QTextEdit, QFileDialog, QRadioButton,
+    QHeaderView, QTextEdit, QFileDialog, QRadioButton, QButtonGroup,
+    QStackedWidget, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
+    QMessageBox,
 )
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QColor
 
 from common import (
     PAL, COMBO_STYLE, BTN_STYLE, GRP_STYLE, INPUT_STYLE, SPLITTER_STYLE,
-    MPL_AVAILABLE, EPICS_AVAILABLE, TILED_AVAILABLE, TiledWriter, PVMonitor, PVLabel,
+    MPL_AVAILABLE, EPICS_AVAILABLE, PVMonitor, PVLabel, CameraPanel,
 )
+from scan_types import XASScanDef, XASSubrange, sim_scalar
+from devices import device_name, all_device_map
 
 if MPL_AVAILABLE:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
-
-import csv
-import numpy as np
-
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
-
-try:
-    import h5py
-    H5_AVAILABLE = True
-except ImportError:
-    H5_AVAILABLE = False
-
-from scan_types import (
-        ALL_SCAN_TYPES, DET_SCALAR, DET_AREA,
-        detector_kind, sim_scalar,
-        _AREA_LABELS, _AREA_COLORS,
-    )
-
-from devices import all_device_map
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-SCAN_ACQ_TIMEOUT_S = 30.0   # max seconds to wait for area-detector acquire
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 SPIN_STYLE = f"""
@@ -96,6 +74,16 @@ CHECK_STYLE = f"""
         background:{PAL['accent']}; border-color:{PAL['accent']};
     }}
 """
+RADIO_STYLE = f"""
+    QRadioButton {{ color:{PAL['text']}; spacing:6px; }}
+    QRadioButton::indicator {{
+        width:14px; height:14px; border:1px solid #2a3a5e;
+        border-radius:7px; background:{PAL['bg']};
+    }}
+    QRadioButton::indicator:checked {{
+        background:{PAL['accent']}; border-color:{PAL['accent']};
+    }}
+"""
 
 # ── Scan state machine ────────────────────────────────────────────────────────
 class _ScanState:
@@ -122,7 +110,7 @@ class DetectorTable(QTableWidget):
         self.setAlternatingRowColors(False)
         self._row_map: dict = {}   # pv → row index
         self._populate()
-        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
+        PVMonitor().value_changed.connect(self._on_pv)
 
     def _populate(self):
         for name, pv in self._det_pvs.items():
@@ -164,26 +152,89 @@ class DetectorTable(QTableWidget):
 
 # ── Scan plot ─────────────────────────────────────────────────────────────────
 class ScanPlot(QWidget):
-    """Live scan plot — shows the most recent 1-D scan as it executes."""
+    """Live scan plot — shows the most recent 1-D scan as it executes.
+
+    Features a crosshair cursor that snaps to the nearest data point and
+    displays live Position / Intensity readouts below the canvas.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        vl = QVBoxLayout(self); vl.setContentsMargins(0,0,0,0)
+        vl = QVBoxLayout(self); vl.setContentsMargins(0,0,0,0); vl.setSpacing(2)
         if MPL_AVAILABLE:
             self._fig    = Figure(facecolor=PAL["surface"], tight_layout=True)
             self._ax     = self._fig.add_subplot(111)
             self._line,  = self._ax.plot([], [], color=PAL["accent"],
                                          lw=1.4, marker=".", ms=4)
+            # Crosshair lines — hidden until mouse enters axes
+            self._ch_v = self._ax.axvline(x=0, color=PAL["text"],
+                                          lw=0.8, ls="--", alpha=0.6, visible=False)
+            self._ch_h = self._ax.axhline(y=0, color=PAL["text"],
+                                          lw=0.8, ls="--", alpha=0.6, visible=False)
+            # Snap marker — highlights the nearest data point
+            self._snap_pt, = self._ax.plot([], [], "o",
+                                           color=PAL["ok"], ms=6,
+                                           zorder=5, visible=False)
             self._style_ax()
             self._canvas = FigureCanvas(self._fig)
             self._canvas.setStyleSheet("background:transparent;")
+            self._canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
+            self._canvas.mpl_connect("axes_leave_event",    self._on_axes_leave)
+            from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
+            self._toolbar = NavToolbar(self._canvas, self)
+            self._toolbar.setStyleSheet(f"""
+                QToolBar {{
+                    background:{PAL['surface']}; border:none; spacing:2px;
+                }}
+                QToolButton {{
+                    background:{PAL['surface']}; color:{PAL['text']};
+                    border:1px solid transparent; border-radius:3px;
+                    padding:3px; font-size:8pt;
+                }}
+                QToolButton:hover {{
+                    background:#1e3a5e; border-color:#2a5a8e;
+                }}
+                QToolButton:checked {{
+                    background:{PAL['accent']}; color:{PAL['bg']};
+                    border-color:{PAL['accent']};
+                }}
+            """)
+            # Disable auto-scaling when the user pans/zooms; re-enable on Home
+            self._auto_scale = True
+            self._canvas.mpl_connect("button_release_event", self._on_btn_release)
+            _orig_home = self._toolbar.home
+            def _home(*a, **kw):
+                _orig_home(*a, **kw)
+                self._auto_scale = True
+                self._fit_to_data()
+            self._toolbar.home = _home
+            vl.addWidget(self._toolbar)
             vl.addWidget(self._canvas)
         else:
             ph = QLabel("matplotlib not installed"); ph.setAlignment(Qt.AlignCenter)
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             vl.addWidget(ph)
+
+        # ── Readout bar ───────────────────────────────────────────────────────
+        readout_row = QHBoxLayout(); readout_row.setSpacing(16)
+        readout_row.setContentsMargins(8, 0, 8, 2)
+
+        def _ro_pair(label):
+            lbl = QLabel(label)
+            lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+            val = QLabel("—")
+            val.setStyleSheet(
+                f"color:{PAL['text']}; font-family:monospace; font-size:8pt; "
+                f"min-width:90px;")
+            readout_row.addWidget(lbl); readout_row.addWidget(val)
+            return val
+
+        self._ro_pos = _ro_pair("Position:")
+        self._ro_int = _ro_pair("Intensity:")
+        readout_row.addStretch()
+        vl.addLayout(readout_row)
+
         self._xs: list = []; self._ys: list = []
-        self.ys: list[float] = []
 
     def _style_ax(self):
         ax = self._ax; ax.set_facecolor(PAL["bg"])
@@ -202,15 +253,40 @@ class ScanPlot(QWidget):
         self._ax.set_ylabel(signal_lbl, color=PAL["subtext"], fontsize=8)
         self._ax.set_title(title or "Scan in progress …",
                            color=PAL["text"], fontsize=9)
-        self._ax.relim(); self._canvas.draw_idle()
-        self.ys = []
+        self._ax.set_xlim(0, 1); self._ax.set_ylim(0, 1)
+        self._ax.autoscale(enable=True, axis="both")
+        self._auto_scale = True
+        self._canvas.draw_idle()
+        self._ro_pos.setText("—"); self._ro_int.setText("—")
+
+    def _fit_to_data(self):
+        """Set axis limits to the full data range with padding."""
+        if not self._xs or not MPL_AVAILABLE:
+            return
+        xmin, xmax = min(self._xs), max(self._xs)
+        ymin, ymax = min(self._ys), max(self._ys)
+        # Use 2% / 5% of the data range as padding; for near-constant axes
+        # fall back to 1% of the absolute value so tiny signals still get room
+        xspan = xmax - xmin
+        yspan = ymax - ymin
+        xpad = xspan * 0.02 if xspan else abs(xmax) * 0.01 or 0.5
+        ypad = yspan * 0.05 if yspan else abs(ymax) * 0.05 or abs(ymax) * 0.01 or 1e-10
+        self._ax.set_xlim(xmin - xpad, xmax + xpad)
+        self._ax.set_ylim(ymin - ypad, ymax + ypad)
+        self._canvas.draw_idle()
 
     def add_point(self, x, y):
         self._xs.append(x); self._ys.append(y)
         if not MPL_AVAILABLE: return
         self._line.set_data(self._xs, self._ys)
-        self._ax.relim(); self._ax.autoscale_view(); self._canvas.draw_idle()
-        self.ys.append(y)
+        if getattr(self, "_auto_scale", True) and len(self._xs) >= 2:
+            self._fit_to_data()
+        self._canvas.draw_idle()
+
+    def _on_btn_release(self, ev):
+        """Disable auto-scaling once the user manually pans or zooms."""
+        if hasattr(self, "_toolbar") and self._toolbar.mode:
+            self._auto_scale = False
 
     def finish(self, title=""):
         if not MPL_AVAILABLE: return
@@ -218,275 +294,256 @@ class ScanPlot(QWidget):
                            color=PAL["ok"], fontsize=9)
         self._canvas.draw_idle()
 
-class ScanFileWriter:
-    """Write 1-D or multi-column scan data to HDF5, CSV, or SPEC (.dat).
-
-    Column layout
-    ─────────────
-      col 0          : scan motor (or "_time_s" for time scans)
-      col 1          : selected detector  (y-axis / plotted signal)
-      cols 2..N      : remaining signals then motors, sorted alphabetically
-
-    Lifecycle:  open() → write_point() × N → close()
-    For area detectors, write_image() can be called after each write_point().
-    """
-
-    FMT_HDF5 = 0
-    FMT_CSV  = 1
-    FMT_SPEC = 2
-
-    _ACQ_RBV = ":cam1:Acquire_RBV"   # mirrors DetectorImageViewer constant
-
-    def __init__(self):
-        self._fmt       = None
-        self._path      = None
-        self._meta: dict = {}
-        self._columns: list = []
-        self._xs:   list = []
-        self._data: dict = {}
-        self._img_idx   = 0
-        # handles
-        self._h5file    = None
-        self._csvfile   = None
-        self._csvwriter = None
-        self._specfile  = None
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def open(self, path: str, meta: dict, columns: list) -> bool:
-        """Open file and write header.
-
-        meta keys: motor, detector, start, stop, steps,
-                   exposure, scan_num, prefix, scan_type, det_kind
-        columns  : ordered extra channel names; selected detector must be first.
-        """
-        self._path, self._meta, self._columns = path, meta, list(columns)
-        self._xs = []; self._data = {c: [] for c in self._columns}
-        self._img_idx = 0
-        ext = Path(path).suffix.lower()
-        self._fmt = {".h5": self.FMT_HDF5,
-                     ".csv": self.FMT_CSV,
-                     ".dat": self.FMT_SPEC}.get(ext, self.FMT_CSV)
-        try:
-            if   self._fmt == self.FMT_HDF5: return self._open_hdf5()
-            elif self._fmt == self.FMT_CSV:  return self._open_csv()
-            else:                            return self._open_spec()
-        except Exception as exc:
-            print(f"[ScanFileWriter] open error: {exc}")
-            return False
-
-    def write_point(self, x: float, y: float, extras: dict):
-        """Append one row; extras = {channel_name: float} for all columns."""
-        self._xs.append(x)
-        row = []
-        for c in self._columns:
-            v = extras.get(c, float("nan"))
-            self._data[c].append(v)
-            row.append(v)
-        try:
-            if self._fmt == self.FMT_CSV and self._csvwriter:
-                self._csvwriter.writerow(
-                    [f"{x:.6g}"] + [_fmt_val(v) for v in row])
-                self._csvfile.flush()
-            elif self._fmt == self.FMT_SPEC and self._specfile:
-                self._specfile.write(
-                    "  " + "  ".join([f"{x:.6g}"] +
-                                     [_fmt_val(v) for v in row]) + "\n")
-                self._specfile.flush()
-        except Exception as exc:
-            print(f"[ScanFileWriter] write_point error: {exc}")
-
-    def write_image(self, img: "np.ndarray"):
-        """Store one area-detector frame (HDF5 only).
-        Call immediately after the matching write_point().
-        """
-        if self._fmt != self.FMT_HDF5 or self._h5file is None:
+    # ── Cursor ────────────────────────────────────────────────────────────────
+    def _on_mouse_move(self, ev):
+        if not MPL_AVAILABLE or ev.inaxes is not self._ax or not self._xs:
             return
-        try:
-            grp = self._h5file["scan"].require_group("images")
-            grp.create_dataset(f"img_{self._img_idx:05d}", data=img,
-                               compression="gzip", compression_opts=4)
-            self._img_idx += 1
-        except Exception as exc:
-            print(f"[ScanFileWriter] write_image error: {exc}")
+        # Don't interfere when the toolbar's pan or zoom tool is active
+        if hasattr(self, "_toolbar") and self._toolbar.mode:
+            return
+        # Only track while left mouse button is held
+        if ev.button != 1:
+            return
+        import numpy as np
+        xs = np.asarray(self._xs); ys = np.asarray(self._ys)
+        idx  = int(np.argmin(np.abs(xs - ev.xdata)))
+        snap_x, snap_y = float(xs[idx]), float(ys[idx])
 
-    def close(self, aborted: bool = False):
-        try:
-            if   self._fmt == self.FMT_HDF5: self._close_hdf5(aborted)
-            elif self._fmt == self.FMT_CSV:  self._close_csv(aborted)
-            elif self._fmt == self.FMT_SPEC: self._close_spec(aborted)
-        except Exception as exc:
-            print(f"[ScanFileWriter] close error: {exc}")
+        self._ch_v.set_xdata([snap_x]); self._ch_v.set_visible(True)
+        self._ch_h.set_ydata([snap_y]); self._ch_h.set_visible(True)
+        self._snap_pt.set_data([snap_x], [snap_y]); self._snap_pt.set_visible(True)
+        self._canvas.draw_idle()
 
-    # ── HDF5 ──────────────────────────────────────────────────────────────────
+        self._ro_pos.setText(f"{snap_x:.6g}")
+        self._ro_int.setText(f"{snap_y:.6g}")
 
-    def _open_hdf5(self) -> bool:
-        if not H5_AVAILABLE:
-            raise RuntimeError("h5py not installed — run: pip install h5py")
-        self._h5file = h5py.File(self._path, "w")
-        grp  = self._h5file.create_group("scan")
-        meta = grp.create_group("metadata")
-        for k, v in self._meta.items():
-            meta.attrs[k] = str(v)
-        meta.attrs["timestamp"]   = datetime.now().isoformat()
-        meta.attrs["file_format"] = "AMBER_HiRRIXS_HDF5_v1"
-        meta.attrs["beamline"]    = "ALS BL601 AMBER"
-        meta.attrs["columns"]     = (
-            [self._meta.get("motor", "motor")] + self._columns)
-        return True
-
-    def _close_hdf5(self, aborted: bool):
-        if not self._h5file: return
-        grp  = self._h5file["scan"]
-        data = grp.create_group("data")
-        motor_name = self._meta.get("motor", "motor")
-        ds_x = data.create_dataset(motor_name,
-                                   data=np.array(self._xs, dtype=np.float64))
-        ds_x.attrs["role"] = "scan_motor"; ds_x.attrs["units"] = "user"
-        for i, col in enumerate(self._columns):
-            arr  = np.array(self._data[col], dtype=np.float64)
-            ds_c = data.create_dataset(col, data=arr)
-            ds_c.attrs["role"]  = "detector" if i == 0 else "channel"
-            ds_c.attrs["units"] = "counts"
-        grp.attrs["n_points"] = len(self._xs)
-        grp.attrs["aborted"]  = aborted
-        grp.attrs["n_images"] = self._img_idx
-        self._h5file.close(); self._h5file = None
-
-    # ── CSV ───────────────────────────────────────────────────────────────────
-
-    def _open_csv(self) -> bool:
-        m, now = self._meta, datetime.now()
-        self._csvfile = open(self._path, "w", newline="")
-        hdr_cols = [m.get("motor", "motor")] + self._columns
-        for line in [
-            f"# AMBER HiRRIXS scan — {Path(self._path).stem}",
-            f"# Date:     {now.strftime('%Y-%m-%d %H:%M:%S')}",
-            f"# Beamline: ALS BL601 AMBER",
-            f"# Scan type:{m.get('scan_type','?')}",
-            f"# Motor:    {m.get('motor','?')}",
-            f"# Detector: {m.get('detector','?')}  [{m.get('det_kind','?')}]  (plotted column)",
-            f"# Range:    {m.get('start','?')} → {m.get('stop','?')}  ({m.get('steps','?')} pts)",
-            f"# Exposure: {m.get('exposure','?')} s",
-            f"# Scan #:   {m.get('scan_num','?')}",
-            f"# Columns:  {', '.join(hdr_cols)}",
-        ]:
-            self._csvfile.write(line + "\n")
-        self._csvwriter = csv.writer(self._csvfile)
-        self._csvwriter.writerow(hdr_cols)
-        self._csvfile.flush()
-        return True
-
-    def _close_csv(self, aborted: bool):
-        if not self._csvfile: return
-        if aborted:
-            self._csvfile.write(f"# Aborted after {len(self._xs)} points\n")
-        self._csvfile.close()
-        self._csvfile = None; self._csvwriter = None
-
-    # ── SPEC (.dat) ───────────────────────────────────────────────────────────
-
-    def _open_spec(self) -> bool:
-        m, now = self._meta, datetime.now()
-        motor    = m.get("motor",    "motor")
-        det      = m.get("detector", "detector")
-        start    = m.get("start",    0)
-        stop     = m.get("stop",     1)
-        steps    = m.get("steps",    1)
-        exposure = m.get("exposure", 1.0)
-        scan_num = m.get("scan_num", 1)
-        scan_cmd = m.get("scan_type", "ascan").lower().replace(" ", "_")
-        n_cols   = 1 + len(self._columns)
-
-        self._specfile = open(self._path, "w")
-        f = self._specfile
-        f.write(f"#F {Path(self._path).name}\n")
-        f.write(f"#E {int(now.timestamp())}\n")
-        f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
-        f.write(f"#C AMBER HiRRIXS  ALS BL601  User={m.get('prefix','scan')}\n\n")
-        f.write(f"#S {scan_num} {scan_cmd} {motor} {start} {stop} "
-                f"{steps - 1} {exposure}\n")
-        f.write(f"#D {now.strftime('%a %b %d %H:%M:%S %Y')}\n")
-        f.write(f"#T {exposure}  (Seconds)\n")
-        f.write(f"#C Plotted detector: {det}  [{m.get('det_kind','?')}]\n")
-        f.write(f"#N {n_cols}\n")
-        f.write(f"#L {motor}  " + "  ".join(self._columns) + "\n")
-        f.flush()
-        return True
-
-    def _close_spec(self, aborted: bool):
-        if not self._specfile: return
-        if aborted:
-            self._specfile.write(f"#C Aborted after {len(self._xs)} points\n")
-        self._specfile.write("\n")
-        self._specfile.close(); self._specfile = None
-
-def _fmt_val(v: float) -> str:
-    return "nan" if (v != v) else f"{v:.6g}"
+    def _on_axes_leave(self, _ev):
+        # Cursor stays where it is when the mouse leaves — do nothing
+        pass
 
 # ── DAQ Tab ───────────────────────────────────────────────────────────────────
-SCAN_DWELL_MS = 200
+SCAN_DWELL_MS  = 200
+XAS_SCANS_PATH = Path(__file__).parent.parent / "config" / "xas_scans.json"
+
+_TSPIN = f"""
+    QDoubleSpinBox {{
+        background:{PAL['bg']}; color:{PAL['text']};
+        border:1px solid #2a3a5e; border-radius:4px;
+        padding:3px 6px; font-family:monospace; font-size:8pt;
+    }}
+    QDoubleSpinBox:focus {{ border-color:{PAL['accent']}; }}
+    QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{
+        background:{PAL['surface']}; border:none; width:16px;
+    }}
+"""
+
+
+class XASScanDialog(QDialog):
+    """
+    Dialog for creating or editing a named XAS scan definition.
+
+    Presents a table of subranges (Start / Stop / Step Size / Points),
+    a scan name field, and a motor selector.  Saved scans are persisted
+    to *XAS_SCANS_PATH* as JSON.
+    """
+
+    _HDR = ("Start (eV)", "Stop (eV)", "Step Size (eV)", "Points")
+
+    def __init__(self, motor_names: list[str],
+                 default_motor: str = "MonoEnergy",
+                 existing: "XASScanDef | None" = None,
+                 parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Define XAS Scan")
+        self.resize(560, 440)
+        self.setStyleSheet(f"background:{PAL['bg']}; color:{PAL['text']};")
+
+        self._motor_names   = motor_names
+        self._default_motor = default_motor
+        self._result_def: "XASScanDef | None" = None
+
+        vl = QVBoxLayout(self); vl.setSpacing(10); vl.setContentsMargins(14,14,14,14)
+
+        # ── Name row ──────────────────────────────────────────────────────────
+        name_row = QHBoxLayout()
+        name_lbl = QLabel("Scan name")
+        name_lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        name_row.addWidget(name_lbl)
+        self._name_edit = QLineEdit(existing.name if existing else "New XAS Scan")
+        self._name_edit.setStyleSheet(INPUT_STYLE)
+        name_row.addWidget(self._name_edit, 1)
+        vl.addLayout(name_row)
+
+        # ── Motor row ─────────────────────────────────────────────────────────
+        motor_row = QHBoxLayout()
+        motor_lbl = QLabel("Motor")
+        motor_lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        motor_row.addWidget(motor_lbl)
+        self._motor_combo = QComboBox(); self._motor_combo.setStyleSheet(COMBO_STYLE)
+        for n in motor_names: self._motor_combo.addItem(n)
+        target = (existing.motor if existing else default_motor)
+        idx = self._motor_combo.findText(target)
+        if idx >= 0: self._motor_combo.setCurrentIndex(idx)
+        motor_row.addWidget(self._motor_combo, 1)
+        vl.addLayout(motor_row)
+
+        # ── Exposure time row ─────────────────────────────────────────────────
+        exp_row = QHBoxLayout(); exp_row.setSpacing(6)
+        exp_lbl = QLabel("Exposure time (s)")
+        exp_lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        exp_row.addWidget(exp_lbl)
+        self._exp_spin = QDoubleSpinBox()
+        self._exp_spin.setRange(0.05, 3600.0); self._exp_spin.setDecimals(2)
+        self._exp_spin.setSingleStep(0.1)
+        self._exp_spin.setValue(existing.exposure_time if existing else 1.0)
+        self._exp_spin.setStyleSheet(_TSPIN)
+        exp_row.addWidget(self._exp_spin)
+        exp_row.addStretch()
+        vl.addLayout(exp_row)
+
+        # ── Subrange table ────────────────────────────────────────────────────
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(self._HDR)
+        self._table.setStyleSheet(f"""
+            QTableWidget {{
+                background:{PAL['surface']}; color:{PAL['text']};
+                gridline-color:#2a3a5e; border:1px solid #2a3a5e;
+                font-size:8pt;
+            }}
+            QHeaderView::section {{
+                background:{PAL['bg']}; color:{PAL['accent']};
+                border:none; padding:4px; font-size:8pt;
+            }}
+            QTableWidget::item:selected {{ background:#1e3a5e; }}
+        """)
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        self._table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._table.verticalHeader().setVisible(False)
+        vl.addWidget(self._table, 1)
+
+        # ── Summary label (created before table population so _add_row can use it)
+        self._summary = QLabel("")
+        self._summary.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+
+        # Populate from existing definition or add one default row
+        if existing and existing.subranges:
+            for sr in existing.subranges:
+                self._add_row(sr.start, sr.stop, sr.step_size)
+        else:
+            self._add_row(250.0, 270.0, 0.5)
+
+        # ── Table buttons ─────────────────────────────────────────────────────
+        tbl_btns = QHBoxLayout(); tbl_btns.setSpacing(6)
+        add_row_btn = QPushButton("＋ Add subrange"); add_row_btn.setStyleSheet(BTN_STYLE)
+        add_row_btn.clicked.connect(self._on_add_row)
+        del_row_btn = QPushButton("− Remove selected"); del_row_btn.setStyleSheet(BTN_STYLE)
+        del_row_btn.clicked.connect(self._on_del_row)
+        tbl_btns.addWidget(add_row_btn); tbl_btns.addWidget(del_row_btn)
+        tbl_btns.addStretch()
+        vl.addLayout(tbl_btns)
+
+        vl.addWidget(self._summary)
+        # ── Dialog buttons ────────────────────────────────────────────────────
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.setStyleSheet(f"""
+            QPushButton {{ {BTN_STYLE} padding:5px 18px; }}
+        """)
+        btns.accepted.connect(self._on_save)
+        btns.rejected.connect(self.reject)
+        vl.addWidget(btns)
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+    def _spin(self, val: float, lo: float = 0.0,
+              hi: float = 100000.0, dec: int = 4) -> QDoubleSpinBox:
+        sp = QDoubleSpinBox()
+        sp.setRange(lo, hi); sp.setValue(val); sp.setDecimals(dec)
+        sp.setStyleSheet(_TSPIN); sp.setFrame(False)
+        sp.valueChanged.connect(self._update_summary)
+        return sp
+
+    def _add_row(self, start=250.0, stop=270.0, step=0.5):
+        r = self._table.rowCount(); self._table.insertRow(r)
+        self._table.setCellWidget(r, 0, self._spin(start))
+        self._table.setCellWidget(r, 1, self._spin(stop))
+        self._table.setCellWidget(r, 2, self._spin(step, lo=1e-6, dec=4))
+        pts_lbl = QLabel("—")
+        pts_lbl.setAlignment(Qt.AlignCenter)
+        pts_lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        self._table.setCellWidget(r, 3, pts_lbl)
+        self._table.setRowHeight(r, 32)
+        self._update_summary()
+
+    def _subranges(self) -> list[XASSubrange]:
+        result = []
+        for r in range(self._table.rowCount()):
+            start = self._table.cellWidget(r, 0).value()
+            stop  = self._table.cellWidget(r, 1).value()
+            step  = self._table.cellWidget(r, 2).value()
+            result.append(XASSubrange(start, stop, step))
+        return result
+
+    def _update_summary(self):
+        total = 0
+        for r in range(self._table.rowCount()):
+            w0 = self._table.cellWidget(r, 0)
+            w1 = self._table.cellWidget(r, 1)
+            w2 = self._table.cellWidget(r, 2)
+            if not (w0 and w1 and w2): continue
+            sr  = XASSubrange(w0.value(), w1.value(), w2.value())
+            n   = sr.n_points()
+            pts_lbl = self._table.cellWidget(r, 3)
+            if pts_lbl: pts_lbl.setText(str(n))
+            total += n
+        # Subtract shared boundary points between consecutive subranges
+        if self._table.rowCount() > 1:
+            total -= (self._table.rowCount() - 1)
+        self._summary.setText(f"Total: {max(total, 0)} points")
+
+    def _on_add_row(self):
+        # Default next row continues from previous stop
+        if self._table.rowCount():
+            prev_stop = self._table.cellWidget(self._table.rowCount()-1, 1).value()
+            prev_step = self._table.cellWidget(self._table.rowCount()-1, 2).value()
+            self._add_row(prev_stop, prev_stop + 20.0, prev_step)
+        else:
+            self._add_row()
+
+    def _on_del_row(self):
+        rows = sorted({idx.row() for idx in self._table.selectedIndexes()}, reverse=True)
+        for r in rows: self._table.removeRow(r)
+        if self._table.rowCount() == 0:
+            self._add_row()
+        self._update_summary()
+
+    def _on_save(self):
+        name = self._name_edit.text().strip() or "XAS Scan"
+        motor = self._motor_combo.currentText()
+        exp   = self._exp_spin.value()
+        srs = self._subranges()
+        if not srs:
+            return
+        self._result_def = XASScanDef(name=name, motor=motor,
+                                      exposure_time=exp, subranges=srs)
+        self.accept()
+
+    def result_def(self) -> "XASScanDef | None":
+        return self._result_def
+
 
 class DAQTab(QWidget):
-    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict, config_tab=None, app_cfg=None, parent=None):
-        # Store for apply_config use
-        self._config_tab = config_tab
-        self._app_cfg = app_cfg or {}
-        tiled_cfg     = self._app_cfg.get("tiled", {})
-        self._tiled   = TiledWriter(tiled_cfg)
+    def __init__(self, amber_cfg: dict, hirrixs_cfg: dict,
+                 config_tab=None, app_cfg: dict | None = None, parent=None):
         super().__init__(parent)
+        self._config_tab = config_tab
+        self._app_cfg    = app_cfg or {}
+        self._xas_default_motor = amber_cfg.get("xas_default_motor", "MonoEnergy")
+        self._xas_scan_defs: list[XASScanDef] = []
+        self._load_xas_scans()
         self.setStyleSheet(f"background:{PAL['bg']};")
         self._state = _ScanState.IDLE
-        self._writer: ScanFileWriter | None = None
-        self._scan_columns: list = []   # ordered extra channel names
-        # active scan type (BaseScan instance, one per type kept alive)
-        self._scan_instances = [ST() for ST in ALL_SCAN_TYPES]
-        self._device_map: dict = all_device_map(amber_cfg, hirrixs_cfg)
-        self._queue_tab = None   # set later via set_queue_tab()
-        self._active_scan_idx = 0        # index into _scan_instances
- 
-        # area-detector state
-        self._det_kind   = DET_SCALAR
-        self._acquiring  = False
-        self._acq_deadline = 0.0
-        self._last_outer:      int   = -1
-        self._last_area_scalar:float = float("nan")
-        # store base PV prefix for each area detector (needed to trigger)
-        self._det_pvs:  dict = {}
-        self._det_base: dict = {}
-        for n, p in hirrixs_cfg.get("detector", {}).items():
-            self._det_base[n] = p                  # base prefix, e.g. "6013SIM1"
-            self._det_pvs[n]  = p + ":Acquire_RBV" # CA readback PV
         self._scan_idx = 0; self._scan_positions: list = []
         self._scan_timer = QTimer(self); self._scan_timer.timeout.connect(self._scan_step)
-
-        # ── Queue-server live-display state ───────────────────────────────────
-        self._qs_elapsed_timer = QTimer(self)
-        self._qs_elapsed_timer.setInterval(1000)
-        self._qs_elapsed_timer.timeout.connect(self._qs_update_elapsed)
-        self._qs_motor_pv  = ""
-        self._qs_det_pv    = ""
-        self._qs_n_steps   = 0
-        self._qs_t0        = 0.0
-        self._qs_last_x    = None
-        self._qs_active    = False
-        self._qs_pending: dict = {}
-
-        # ── Queue-server live-display state ───────────────────────────────────
-        # Data points are driven by EPICS PV callbacks (value_changed signal),
-        # not a polling timer, so every motor step is captured.
-        # A separate 1 Hz timer updates only the elapsed-time label.
-        self._qs_elapsed_timer = QTimer(self)
-        self._qs_elapsed_timer.setInterval(1000)
-        self._qs_elapsed_timer.timeout.connect(self._qs_update_elapsed)
-        self._qs_motor_pv  = ""
-        self._qs_det_pv    = ""
-        self._qs_n_steps   = 0
-        self._qs_t0        = 0.0
-        self._qs_last_x    = None    # last recorded motor position (float or None)
-        self._qs_active    = False   # True while a QS scan is being displayed
-        # Pending info set at _add_to_queue time so the callback can arm early
-        self._qs_pending: dict = {}  # {motor_pv, det_pv, motor_lbl, det_lbl, n_steps, plan_name}
 
         # Build motor / signal / detector dicts from configs
         self._motor_pvs  = self._collect_pvs(amber_cfg,   "motor")
@@ -497,6 +554,24 @@ class DAQTab(QWidget):
         self._det_pvs: dict = {}
         for n, p in hirrixs_cfg.get("detector", {}).items():
             self._det_pvs[n] = p + ":Acquire_RBV"
+        self._camera_pvs: dict = dict(hirrixs_cfg.get("camera", {}))
+
+        # ── Device name map (friendly → ophyd) for QS live display ───────────
+        self._device_map: dict = all_device_map(amber_cfg, hirrixs_cfg)
+
+        # ── Queue-server live display state ───────────────────────────────────
+        self._qs_active   = False
+        self._qs_motor_pv = ""
+        self._qs_det_pv   = ""
+        self._qs_n_steps  = 0
+        self._qs_t0       = 0.0
+        self._qs_last_x   = None   # last recorded motor position (float or None)
+        self._qs_last_t   = 0.0    # timestamp of last recorded point (monotonic)
+        self._qs_min_dt   = 0.5
+        self._qs_pending: dict = {}
+
+        # ── RIXS excitation energies (From XAS list) ──────────────────────────
+        self._rixs_energies: list[float] = []
 
         outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
         hdr = QLabel("  💾  Data Acquisition")
@@ -504,66 +579,298 @@ class DAQTab(QWidget):
         hdr.setStyleSheet(f"background:{PAL['surface']}; color:{PAL['accent']}; padding:6px;")
         outer.addWidget(hdr)
 
-        # Main horizontal splitter: left controls | right plot+log
+        self._qs_elapsed_timer = QTimer(self)
+        self._qs_elapsed_timer.setInterval(1000)
+        self._qs_elapsed_timer.timeout.connect(self._qs_update_elapsed)
+
+        # ── Main area: three-column horizontal splitter ───────────────────────
         hsplit = QSplitter(Qt.Horizontal); hsplit.setStyleSheet(SPLITTER_STYLE)
 
-        # ── Left panel ────────────────────────────────────────────────────────
+        # ── Left column: File Output / Scan Params / Run Control / QS Status / Camera ──
         left = QWidget(); left.setStyleSheet(f"background:{PAL['bg']};")
         lv = QVBoxLayout(left); lv.setContentsMargins(8,8,8,8); lv.setSpacing(10)
         lv.addWidget(self._build_file_group())
         lv.addWidget(self._build_scan_group())
         lv.addWidget(self._build_run_group())
         lv.addWidget(self._build_status_group())
-        lv.addStretch()
-        left.setMinimumWidth(320); left.setMaximumWidth(480)
 
+        cam_grp = QGroupBox("Camera"); cam_grp.setStyleSheet(GRP_STYLE)
+        cam_grp.setMinimumHeight(260)
+        cg_vl = QVBoxLayout(cam_grp); cg_vl.setContentsMargins(4,18,4,4)
+        self._camera_panel = CameraPanel(self._camera_pvs)
+        cg_vl.addWidget(self._camera_panel)
+        lv.addWidget(cam_grp)
+
+        # Left column stretches to the bottom — no addStretch()
+        left.setMinimumWidth(320); left.setMaximumWidth(480)
         scroll_left = QScrollArea(); scroll_left.setWidgetResizable(True)
         scroll_left.setStyleSheet(f"background:{PAL['bg']}; border:none;")
         scroll_left.setWidget(left)
         hsplit.addWidget(scroll_left)
 
-        if config_tab is not None:
-            self._seed_from_config(config_tab)
+        # ── Centre + log (vertical) ───────────────────────────────────────────
+        centre_log_widget = QWidget(); centre_log_widget.setStyleSheet(f"background:{PAL['bg']};")
+        centre_log_vl = QVBoxLayout(centre_log_widget)
+        centre_log_vl.setContentsMargins(0, 0, 0, 0); centre_log_vl.setSpacing(4)
 
-        # ── Right panel ───────────────────────────────────────────────────────
-        vsplit = QSplitter(Qt.Vertical); vsplit.setStyleSheet(SPLITTER_STYLE)
+        centre_vsplit = QSplitter(Qt.Vertical); centre_vsplit.setStyleSheet(SPLITTER_STYLE)
 
-        self._scan_plot = ScanPlot()
-        vsplit.addWidget(self._scan_plot)
+        xas_grp = QGroupBox("XAS"); xas_grp.setStyleSheet(GRP_STYLE)
+        xg_vl = QVBoxLayout(xas_grp); xg_vl.setContentsMargins(4,18,4,4)
+        self._xas_plot = ScanPlot()
+        xg_vl.addWidget(self._xas_plot)
+        centre_vsplit.addWidget(xas_grp)
 
-        det_grp = QGroupBox("Live Detector Readouts"); det_grp.setStyleSheet(GRP_STYLE)
-        dg_v = QVBoxLayout(det_grp); dg_v.setContentsMargins(6,18,6,6)
-        self._det_table = DetectorTable(dict(self._det_pvs))
-        dg_v.addWidget(self._det_table)
+        rixs_grp = QGroupBox("RIXS"); rixs_grp.setStyleSheet(GRP_STYLE)
+        rg_vl = QVBoxLayout(rixs_grp); rg_vl.setContentsMargins(4,18,4,4)
+        self._rixs_plot = ScanPlot()
+        rg_vl.addWidget(self._rixs_plot)
+        centre_vsplit.addWidget(rixs_grp)
 
-        # Add-detector row
-        add_row = QHBoxLayout(); add_row.setSpacing(6)
-        self._det_name_edit = QLineEdit(); self._det_name_edit.setPlaceholderText("Name")
-        self._det_name_edit.setStyleSheet(INPUT_STYLE); self._det_name_edit.setFixedWidth(110)
-        self._det_pv_edit = QLineEdit(); self._det_pv_edit.setPlaceholderText("PV string")
-        self._det_pv_edit.setStyleSheet(INPUT_STYLE)
-        add_det_btn = QPushButton("＋ Add"); add_det_btn.setStyleSheet(BTN_STYLE)
-        add_det_btn.setFixedWidth(64)
-        add_det_btn.clicked.connect(self._add_detector)
-        add_row.addWidget(QLabel("Add:")); add_row.addWidget(self._det_name_edit)
-        add_row.addWidget(self._det_pv_edit); add_row.addWidget(add_det_btn)
-        dg_v.addLayout(add_row)
-        vsplit.addWidget(det_grp)
+        centre_vsplit.setSizes([500, 500])
+        centre_log_vl.addWidget(centre_vsplit, 1)
 
+        # Acquisition log — same width as XAS/RIXS panels
         log_grp = QGroupBox("Acquisition Log"); log_grp.setStyleSheet(GRP_STYLE)
         lg_v = QVBoxLayout(log_grp); lg_v.setContentsMargins(6,18,6,6)
         self._log = QTextEdit(); self._log.setReadOnly(True)
-        self._log.setStyleSheet(LOG_STYLE); self._log.setMaximumHeight(160)
+        self._log.setStyleSheet(LOG_STYLE); self._log.setFixedHeight(130)
         lg_v.addWidget(self._log)
         clr_log_btn = QPushButton("Clear log"); clr_log_btn.setStyleSheet(BTN_STYLE)
         clr_log_btn.setFixedWidth(80); clr_log_btn.clicked.connect(self._log.clear)
         lg_v.addWidget(clr_log_btn, alignment=Qt.AlignRight)
-        vsplit.addWidget(log_grp)
+        centre_log_vl.addWidget(log_grp)
 
-        vsplit.setSizes([420, 280, 160])
-        hsplit.addWidget(vsplit)
-        hsplit.setSizes([360, 1200])
+        hsplit.addWidget(centre_log_widget)
+
+        # ── Right column: XAS controls + RIXS controls + RE controls ─────────
+        right_widget = QWidget(); right_widget.setStyleSheet(f"background:{PAL['bg']};")
+        right_vl = QVBoxLayout(right_widget)
+        right_vl.setContentsMargins(0, 0, 0, 0); right_vl.setSpacing(4)
+
+        right_vsplit = QSplitter(Qt.Vertical); right_vsplit.setStyleSheet(SPLITTER_STYLE)
+        right_vsplit.addWidget(self._build_xas_panel())
+        right_vsplit.addWidget(self._build_rixs_panel())
+        right_vsplit.setSizes([500, 500])
+        right_vl.addWidget(right_vsplit, 1)
+
+        right_vl.addWidget(self._build_re_controls())
+        hsplit.addWidget(right_widget)
+
+        hsplit.setSizes([380, 900, 240])
         outer.addWidget(hsplit, 1)
+
+    # ── Queue tab wiring ──────────────────────────────────────────────────────
+    def set_queue_tab(self, qt) -> None:
+        """Wire in the QueueTab for plan submission and live scan display."""
+        self._queue_tab = qt
+        qt.running_item_changed.connect(self._on_qs_running_item)
+        self._log_msg("Queue server tab connected.", PAL["subtext"])
+
+    # ── Queue-server live display ─────────────────────────────────────────────
+
+    def _qs_arm(self, motor_pv: str, det_pv: str,
+                motor_lbl: str, det_lbl: str,
+                n_steps: int, plan_name: str) -> None:
+        """Subscribe PVs and connect the motor callback so data collection
+        starts immediately — called from _on_xas_queue (before the scan
+        starts) and from _on_qs_running_item (safety net).
+        Safe to call multiple times; UniqueConnection prevents duplicates.
+        """
+        if motor_pv:
+            PVMonitor().subscribe(motor_pv)
+        if det_pv:
+            PVMonitor().subscribe(det_pv)
+
+        self._qs_motor_pv = motor_pv
+        self._qs_det_pv   = det_pv
+        self._qs_n_steps  = n_steps
+        self._qs_last_x   = None
+        self._qs_last_t   = 0.0
+        exp = self._p_exp.value() if hasattr(self, "_p_exp") else 0.5
+        self._qs_min_dt = max(exp * 0.5, 0.1)
+
+        if not self._qs_active:
+            self._qs_active = True
+            self._qs_t0     = time.monotonic()
+            self._xas_plot.reset(motor_lbl, det_lbl,
+                                 f"QServer: {plan_name}  (waiting…)")
+            self._progress.setMaximum(n_steps if n_steps else 0)
+            self._progress.setValue(0)
+            self._set_state(_ScanState.RUNNING)
+            self._st_file.setText(f"{plan_name} · pending")
+            self._st_file.setStyleSheet(
+                f"color:{PAL['accent']}; font-family:monospace; font-size:8pt;")
+            self._st_point.setText("0" + (f" / {n_steps}" if n_steps else ""))
+            self._st_elapsed.setText("0.0 s")
+            try:
+                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
+            except RuntimeError:
+                pass
+            PVMonitor().value_changed.connect(
+                self._on_qs_motor_callback, Qt.UniqueConnection)
+            self._qs_elapsed_timer.start()
+
+    def _on_qs_running_item(self, item: dict) -> None:
+        """Called when the queue server starts or finishes a scan."""
+        # ── Scan ended ────────────────────────────────────────────────────────
+        if not item:
+            try:
+                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
+            except RuntimeError:
+                pass
+            if self._qs_active:
+                self._qs_active = False
+                self._qs_elapsed_timer.stop()
+                elapsed = time.monotonic() - self._qs_t0
+                self._xas_plot.finish("QServer scan complete")
+                self._log_msg(
+                    f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
+                self._set_state(_ScanState.IDLE)
+                self._st_file.setText("—")
+                self._st_file.setStyleSheet(
+                    f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
+                self._qs_pending = {}
+            return
+
+        # ── Scan running ──────────────────────────────────────────────────────
+        plan      = item.get("name", "?")
+        args      = item.get("args", [])
+        uid_short = item.get("item_uid", "")[:8]
+
+        self._log_msg(
+            f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
+
+        if self._qs_active:
+            self._xas_plot._ax.set_title(
+                f"QServer: {plan}  (…{uid_short})",
+                color=PAL["text"], fontsize=9)
+            if hasattr(self._xas_plot, "_canvas"):
+                self._xas_plot._canvas.draw_idle()
+            self._st_file.setText(f"{plan} · …{uid_short}")
+            self._qs_last_x = None
+            self._qs_record_now()
+            return
+
+        # Safety net: scan was queued from another client — resolve PVs from args
+        inv_map = {v: k for k, v in self._device_map.items()}
+
+        def _resolve(devname):
+            friendly = inv_map.get(str(devname), str(devname))
+            pv = (self._motor_pvs.get(friendly)
+                  or self._signal_pvs.get(friendly)
+                  or self._det_pvs.get(friendly)
+                  or "")
+            return friendly, pv
+
+        det_arg   = args[0] if args else ""
+        if isinstance(det_arg, list):
+            det_arg = det_arg[0] if det_arg else ""
+        motor_arg = args[1] if len(args) > 1 else ""
+        n_steps   = len(args[2]) if len(args) > 2 and isinstance(args[2], list) else 0
+
+        motor_lbl, motor_pv = _resolve(motor_arg)
+        det_lbl,   det_pv   = _resolve(det_arg)
+
+        if not motor_pv:
+            motor_lbl = self._motor_combo.currentText()
+            motor_pv  = self._motor_pvs.get(motor_lbl, "")
+        if not det_pv:
+            det_lbl = self._det_combo.currentText()
+            det_pv  = ({**self._signal_pvs, **self._det_pvs}).get(det_lbl, "")
+
+        self._qs_arm(motor_pv, det_pv, motor_lbl, det_lbl, n_steps, plan)
+        self._xas_plot._ax.set_title(
+            f"QServer: {plan}  (…{uid_short})", color=PAL["text"], fontsize=9)
+        if hasattr(self._xas_plot, "_canvas"):
+            self._xas_plot._canvas.draw_idle()
+        self._st_file.setText(f"{plan} · …{uid_short}")
+
+    def _on_qs_motor_callback(self, pv_name: str, value) -> None:
+        """Fires on every PVMonitor value_changed while a QS scan is active."""
+        if not self._qs_active:
+            return
+        if pv_name != self._qs_motor_pv:
+            return
+        if value is None:
+            return
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return
+
+        now      = time.monotonic()
+        too_soon = (now - self._qs_last_t) < self._qs_min_dt
+        same_pos = (self._qs_last_x is not None
+                    and abs(x - self._qs_last_x) < 1e-6)
+        if too_soon and same_pos:
+            return
+        if too_soon and self._qs_last_x is not None:
+            return
+        self._qs_last_x = x
+        self._qs_last_t = now
+
+        if EPICS_AVAILABLE and self._qs_det_pv:
+            raw = PVMonitor().get(self._qs_det_pv)
+            y = float(raw) if raw is not None else float("nan")
+        else:
+            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
+
+        self._xas_plot.add_point(x, y)
+        n_pts = len(self._xas_plot._xs)
+        n     = self._qs_n_steps
+        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
+        if n:
+            self._progress.setValue(min(n_pts, n))
+
+    def _qs_update_elapsed(self) -> None:
+        """Update the elapsed-time label once per second."""
+        if self._qs_active:
+            self._st_elapsed.setText(f"{time.monotonic() - self._qs_t0:.1f} s")
+
+    def _qs_record_now(self) -> None:
+        """Sample motor and detector PVs immediately and record a point.
+
+        Called at scan-start confirmation to capture the first position,
+        which may not generate a motor callback if the motor was already there.
+        """
+        if not self._qs_active or not self._qs_motor_pv:
+            return
+        if EPICS_AVAILABLE:
+            raw_x = PVMonitor().get(self._qs_motor_pv)
+            x = float(raw_x) if raw_x is not None else None
+        else:
+            idx  = self._xas_scan_combo.currentIndex()
+            defn = (self._xas_scan_defs[idx]
+                    if 0 <= idx < len(self._xas_scan_defs) else None)
+            positions = defn.all_positions() if defn else []
+            x = positions[0] if positions else None
+
+        if x is None:
+            return
+        if self._qs_last_x is not None and abs(x - self._qs_last_x) < 1e-6:
+            return
+        self._qs_last_x = x
+        self._qs_last_t = time.monotonic()
+
+        if EPICS_AVAILABLE and self._qs_det_pv:
+            raw_y = PVMonitor().get(self._qs_det_pv)
+            y = float(raw_y) if raw_y is not None else float("nan")
+        else:
+            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
+
+        self._xas_plot.add_point(x, y)
+        n_pts = len(self._xas_plot._xs)
+        n     = self._qs_n_steps
+        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
+        if n:
+            self._progress.setValue(min(n_pts, n))
+
+    # ── Live config updates ───────────────────────────────────────────────────
+    def apply_config(self, key: str, value):
+        """Receive a config_changed signal from ConfigurationTab."""
+        if key == "data_acquisition.default_output_dir" and value:
+            self._dir_edit.setText(str(Path(str(value)).expanduser()))
 
     # ── Config helpers ────────────────────────────────────────────────────────
     @staticmethod
@@ -578,54 +885,6 @@ class DAQTab(QWidget):
                         out[f"{k}:{sk}"] = sv
         return out
 
-    def _seed_from_config(self, config_tab):
-        """Populate file-output widgets from configuration.json at startup."""
-        out_dir = config_tab.get("data_acquisition.default_output_dir")
-        if out_dir:
-            import os
-            self._dir_edit.setText(os.path.expanduser(out_dir))
-
-        prefix = config_tab.get("data_acquisition.default_prefix")
-        if prefix:
-            self._prefix_edit.setText(prefix)
-
-        mode = config_tab.get("data_acquisition.filename_mode")
-        if mode == "timestamp":
-            self._rb_ts.setChecked(True)
-        else:
-            self._rb_num.setChecked(True)
-
-        auto_inc = config_tab.get("data_acquisition.auto_increment")
-        if auto_inc is not None:
-            self._auto_inc.setChecked(bool(auto_inc))
-
-        fmt = config_tab.get("data_acquisition.default_format")
-        fmt_map = {"HDF5": 0, "CSV": 1, "SPEC": 2}
-        if fmt in fmt_map:
-            self._fmt_combo.setCurrentIndex(fmt_map[fmt])
-
-        self._update_fname_preview()
-
-    def apply_config(self, key: str, value):
-        """Slot wired to ConfigurationTab.config_changed — live updates."""
-        import os
-        if key == "data_acquisition.default_output_dir":
-            self._dir_edit.setText(os.path.expanduser(str(value)))
-        elif key == "data_acquisition.default_prefix":
-            self._prefix_edit.setText(str(value))
-        elif key == "data_acquisition.filename_mode":
-            if value == "timestamp":
-                self._rb_ts.setChecked(True)
-            else:
-                self._rb_num.setChecked(True)
-        elif key == "data_acquisition.auto_increment":
-            self._auto_inc.setChecked(bool(value))
-        elif key == "data_acquisition.default_format":
-            fmt_map = {"HDF5": 0, "CSV": 1, "SPEC": 2}
-            if value in fmt_map:
-                self._fmt_combo.setCurrentIndex(fmt_map[value])
-        self._update_fname_preview()
-
     # ── UI builders ───────────────────────────────────────────────────────────
     def _build_file_group(self):
         grp = QGroupBox("File Output"); grp.setStyleSheet(GRP_STYLE)
@@ -635,7 +894,12 @@ class DAQTab(QWidget):
             lb = QLabel(t); lb.setStyleSheet(f"color:{PAL['subtext']};"); return lb
 
         gl.addWidget(ql("Directory"), 0, 0)
-        self._dir_edit = QLineEdit(str(Path.home()))
+        default_dir = str(Path.home() / "Data")
+        if self._config_tab is not None:
+            cfg_dir = self._config_tab.get("data_acquisition.default_output_dir")
+            if cfg_dir:
+                default_dir = str(Path(cfg_dir).expanduser())
+        self._dir_edit = QLineEdit(default_dir)
         self._dir_edit.setStyleSheet(INPUT_STYLE)
         gl.addWidget(self._dir_edit, 0, 1)
         browse_btn = QPushButton("…"); browse_btn.setStyleSheet(BTN_STYLE)
@@ -646,162 +910,61 @@ class DAQTab(QWidget):
         self._prefix_edit = QLineEdit("scan")
         self._prefix_edit.setStyleSheet(INPUT_STYLE); gl.addWidget(self._prefix_edit, 1, 1, 1, 2)
 
-        gl.addWidget(ql("Format"), 2, 0)
-        self._fmt_combo = QComboBox(); self._fmt_combo.setStyleSheet(COMBO_STYLE)
-        for fmt in ("HDF5 (.h5)", "CSV (.csv)", "SPEC (.dat)"): self._fmt_combo.addItem(fmt)
-        gl.addWidget(self._fmt_combo, 2, 1, 1, 2)
-
-        # ── Numbering mode radio buttons ──────────────────────────────────────
-        gl.addWidget(ql("Numbering"), 3, 0)
-        mode_w = QWidget(); mode_w.setStyleSheet("background:transparent;")
-        mode_hl = QHBoxLayout(mode_w); mode_hl.setContentsMargins(0,0,0,0); mode_hl.setSpacing(12)
-        _rb_style = f"QRadioButton {{ color:{PAL['text']}; }} " \
-                    f"QRadioButton::indicator {{ width:13px; height:13px; " \
-                    f"border:1px solid #2a3a5e; border-radius:7px; background:{PAL['bg']}; }} " \
-                    f"QRadioButton::indicator:checked {{ background:{PAL['accent']}; " \
-                    f"border-color:{PAL['accent']}; }}"
-        self._rb_num  = QRadioButton("Scan number"); self._rb_num.setStyleSheet(_rb_style)
-        self._rb_ts   = QRadioButton("Timestamp (YYYYMMDDHHMMSS)"); self._rb_ts.setStyleSheet(_rb_style)
-        self._rb_num.setChecked(True)
-        mode_hl.addWidget(self._rb_num); mode_hl.addWidget(self._rb_ts); mode_hl.addStretch()
-        gl.addWidget(mode_w, 3, 1, 1, 2)
-
-        # ── Scan number row (only visible in number mode) ─────────────────────
-        self._scan_num_lbl = ql("Scan number")
-        gl.addWidget(self._scan_num_lbl, 4, 0)
+        gl.addWidget(ql("Scan number"), 2, 0)
         self._scan_num = QSpinBox(); self._scan_num.setRange(1, 99999)
         self._scan_num.setValue(1); self._scan_num.setStyleSheet(SPIN_STYLE)
-        gl.addWidget(self._scan_num, 4, 1, 1, 2)
+        gl.addWidget(self._scan_num, 2, 1, 1, 2)
+
+        gl.addWidget(ql("Format"), 3, 0)
+        self._fmt_combo = QComboBox(); self._fmt_combo.setStyleSheet(COMBO_STYLE)
+        for fmt in ("HDF5 (.h5)", "CSV (.csv)", "SPEC (.dat)"): self._fmt_combo.addItem(fmt)
+        gl.addWidget(self._fmt_combo, 3, 1, 1, 2)
 
         self._auto_inc = QCheckBox("Auto-increment scan number")
         self._auto_inc.setStyleSheet(CHECK_STYLE); self._auto_inc.setChecked(True)
-        gl.addWidget(self._auto_inc, 5, 0, 1, 3)
+        gl.addWidget(self._auto_inc, 4, 0, 1, 3)
 
-        # ── Tiled output ──────────────────────────────────────────────────────
-        self._tiled_chk = QCheckBox("Save to Tiled server")
-        self._tiled_chk.setStyleSheet(CHECK_STYLE)
-        # Default: enabled if tiled section says so AND package is available.
-        tiled_cfg = self._app_cfg.get("tiled", {})
-        self._tiled_chk.setChecked(
-            TILED_AVAILABLE and tiled_cfg.get("enabled", False)
-        )
-        if not TILED_AVAILABLE:
-            self._tiled_chk.setEnabled(False)
-            self._tiled_chk.setToolTip("tiled package not installed")
-        gl.addWidget(self._tiled_chk, 5, 0, 1, 2)
-
-        # "Test" button — quick connection probe without running a scan.
-        self._tiled_test_btn = QPushButton("Test")
-        self._tiled_test_btn.setStyleSheet(BTN_STYLE)
-        self._tiled_test_btn.setFixedWidth(48)
-        self._tiled_test_btn.setEnabled(TILED_AVAILABLE)
-        self._tiled_test_btn.clicked.connect(self._test_tiled)
-        gl.addWidget(self._tiled_test_btn, 5, 2)
-
-        #return grp
-
-
-        # ── Preview label ─────────────────────────────────────────────────────
-        gl.addWidget(ql("Preview"), 6, 0)
-        self._fname_preview = QLabel("")
-        self._fname_preview.setStyleSheet(
-            f"color:{PAL['accent']}; font-family:monospace; font-size:8pt; background:transparent;")
-        self._fname_preview.setWordWrap(True)
-        gl.addWidget(self._fname_preview, 6, 1, 1, 2)
-
-        # Wire visibility and preview updates
-        self._rb_num.toggled.connect(self._on_numbering_mode_changed)
-        self._rb_num.toggled.connect(self._update_fname_preview)
-        self._rb_ts.toggled.connect(self._update_fname_preview)
-        self._prefix_edit.textChanged.connect(self._update_fname_preview)
-        self._scan_num.valueChanged.connect(self._update_fname_preview)
-        self._fmt_combo.currentIndexChanged.connect(self._update_fname_preview)
-        self._auto_inc.stateChanged.connect(self._update_fname_preview)
-
-        self._on_numbering_mode_changed(True)   # set initial visibility
-        self._update_fname_preview()
+        self._dated_folders = QCheckBox("Dated folders  (YYYYMMDD/)")
+        self._dated_folders.setStyleSheet(CHECK_STYLE); self._dated_folders.setChecked(False)
+        gl.addWidget(self._dated_folders, 5, 0, 1, 3)
         return grp
 
-     # ── Tiled connection test ─────────────────────────────────────────────────
-    def _test_tiled(self):
-        ok, msg = self._tiled.check_connection()
-        if ok:
-            self._log_msg(f"🔵 Tiled: {msg}", PAL["ok"])
-        else:
-            self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
-
-    def _on_numbering_mode_changed(self, _checked=None):
-        num_mode = self._rb_num.isChecked()
-        self._scan_num_lbl.setVisible(num_mode)
-        self._scan_num.setVisible(num_mode)
-        self._auto_inc.setVisible(num_mode)
-        self._update_fname_preview()
-
-    def _update_fname_preview(self):
-        self._fname_preview.setText(Path(self._current_filename()).name)
-
-    
-
     def _build_scan_group(self):
-        from PySide6.QtWidgets import QStackedWidget, QFrame
+        grp = QGroupBox("1-D Scan Parameters"); grp.setStyleSheet(GRP_STYLE)
+        gl = QGridLayout(grp); gl.setContentsMargins(8,20,8,8); gl.setSpacing(8)
 
-        def _ql_s(text: str) -> QLabel:
-            """Subtext-coloured label for scan group rows."""
-            lb = QLabel(text)
-            lb.setStyleSheet(f"color:{PAL['subtext']};")
-            return lb
+        def ql(t):
+            lb = QLabel(t); lb.setStyleSheet(f"color:{PAL['subtext']};"); return lb
 
-        grp = QGroupBox("Scan Parameters"); grp.setStyleSheet(GRP_STYLE)
-        vl  = QVBoxLayout(grp); vl.setContentsMargins(8, 20, 8, 8); vl.setSpacing(8)
+        gl.addWidget(ql("Motor"), 0, 0)
+        self._motor_combo = QComboBox(); self._motor_combo.setStyleSheet(COMBO_STYLE)
+        for n in self._motor_pvs: self._motor_combo.addItem(n)
+        gl.addWidget(self._motor_combo, 0, 1, 1, 3)
 
-        # ── Scan type selector ────────────────────────────────────────────────
-        row_type = QHBoxLayout()
-        row_type.addWidget(_ql_s("Scan type"))
-        self._type_combo = QComboBox(); self._type_combo.setStyleSheet(COMBO_STYLE)
-        for st in self._scan_instances:
-            self._type_combo.addItem(st.LABEL)
-        row_type.addWidget(self._type_combo, 1)
-        vl.addLayout(row_type)
-
-        # ── Stacked parameter panel (one page per scan type) ──────────────────
-        self._scan_stack = QStackedWidget()
-        motor_names = list(self._motor_pvs.keys())
-        for inst in self._scan_instances:
-            w = inst.build_widget(motor_names)
-            self._scan_stack.addWidget(w)
-        vl.addWidget(self._scan_stack)
-
-        # ── Separator ─────────────────────────────────────────────────────────
-        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
-        sep.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep)
-
-        # ── Detector (shared across all scan types) ───────────────────────────
-        row_det = QHBoxLayout()
-        row_det.addWidget(_ql_s("Detector"))
+        gl.addWidget(ql("Detector"), 1, 0)
         self._det_combo = QComboBox(); self._det_combo.setStyleSheet(COMBO_STYLE)
-        for n in {**self._signal_pvs, **self._det_pvs}:
-            self._det_combo.addItem(n)
-        row_det.addWidget(self._det_combo, 1)
-        self._det_badge = QLabel("scalar")
-        self._det_badge.setStyleSheet(
-            f"color:{PAL['ok']}; font-size:8pt; font-style:italic;")
-        row_det.addWidget(self._det_badge)
-        vl.addLayout(row_det)
+        for n in {**self._signal_pvs, **self._det_pvs}: self._det_combo.addItem(n)
+        gl.addWidget(self._det_combo, 1, 1, 1, 3)
 
-        # ── Exposure ──────────────────────────────────────────────────────────
-        row_exp = QHBoxLayout()
-        row_exp.addWidget(_ql_s("Exposure (s)"))
-        self._p_exp = QDoubleSpinBox()
-        self._p_exp.setRange(0.001, 3600.0); self._p_exp.setValue(0.5)
-        self._p_exp.setDecimals(3); self._p_exp.setStyleSheet(SPIN_STYLE)
-        row_exp.addWidget(self._p_exp, 1)
-        vl.addLayout(row_exp)
+        for row, (lbl, attr, val, lo, hi, dec) in enumerate([
+            ("Start",    "_p_start", -10.0, -1e6, 1e6, 4),
+            ("Stop",     "_p_stop",   10.0, -1e6, 1e6, 4),
+            ("Steps",    None,        None, None, None, None),
+            ("Exposure", "_p_exp",    0.5,  0.001, 3600.0, 3),
+        ], 2):
+            gl.addWidget(ql(lbl), row, 0)
+            if lbl == "Steps":
+                self._p_steps = QSpinBox(); self._p_steps.setRange(2, 10000)
+                self._p_steps.setValue(21); self._p_steps.setStyleSheet(SPIN_STYLE)
+                gl.addWidget(self._p_steps, row, 1, 1, 3)
+            else:
+                sp = QDoubleSpinBox(); sp.setRange(lo, hi); sp.setValue(val)
+                sp.setDecimals(dec); sp.setStyleSheet(SPIN_STYLE)
+                setattr(self, attr, sp); gl.addWidget(sp, row, 1, 1, 3)
 
-        # ── Connect signals ───────────────────────────────────────────────────
-        self._type_combo.currentIndexChanged.connect(self._on_scan_type_changed)
-        self._det_combo.currentTextChanged.connect(self._on_det_changed)
-        self._on_det_changed(self._det_combo.currentText())   # initialise badge
-
+        self._rel_scan = QCheckBox("Relative scan (from current position)")
+        self._rel_scan.setStyleSheet(CHECK_STYLE)
+        gl.addWidget(self._rel_scan, 6, 0, 1, 4)
         return grp
 
     def _build_run_group(self):
@@ -810,12 +973,6 @@ class DAQTab(QWidget):
 
         btn_row = QHBoxLayout(); btn_row.setSpacing(6)
         self._run_btn   = QPushButton("▶  Run");   self._run_btn.setStyleSheet(BTN_STYLE)
-        self._queue_btn = QPushButton("+ Queue")
-        self._queue_btn.setStyleSheet(BTN_STYLE)
-        self._queue_btn.setToolTip("Add current scan parameters to the queue server")
-        self._queue_btn.setEnabled(False)   # enabled once set_queue_tab() is called
-        self._queue_btn.clicked.connect(self._add_to_queue)
-        btn_row.addWidget(self._queue_btn)
         self._pause_btn = QPushButton("⏸  Pause"); self._pause_btn.setStyleSheet(BTN_STYLE)
         self._abort_btn = QPushButton("■  Abort"); self._abort_btn.setStyleSheet(BTN_STYLE)
         self._pause_btn.setEnabled(False); self._abort_btn.setEnabled(False)
@@ -883,14 +1040,21 @@ class DAQTab(QWidget):
             self._log.append(f'<span style="color:{PAL["subtext"]}">[{ts}]</span> {text}')
 
     def _current_filename(self):
-        d      = self._dir_edit.text().strip() or "."
-        prefix = self._prefix_edit.text().strip() or "scan"
-        ext    = {0:".h5", 1:".csv", 2:".dat"}.get(self._fmt_combo.currentIndex(), ".dat")
-        if self._rb_ts.isChecked():
-            suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+        base   = Path(self._dir_edit.text().strip() or ".")
+        if self._dated_folders.isChecked():
+            dated = base / datetime.now().strftime("%Y%m%d")
+            try:
+                dated.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                self._log_msg(f"[warn] Could not create dated folder: {e}", PAL.get("warn", "#ffaa00"))
+                dated = base
+            d = str(dated)
         else:
-            suffix = f"{self._scan_num.value():04d}"
-        return f"{d}/{prefix}_{suffix}{ext}"
+            d = str(base)
+        prefix = self._prefix_edit.text().strip() or "scan"
+        num    = self._scan_num.value()
+        ext    = {0:".h5", 1:".csv", 2:".dat"}.get(self._fmt_combo.currentIndex(), ".dat")
+        return f"{d}/{prefix}_{num:04d}{ext}"
 
     def _set_state(self, state: str):
         self._state = state
@@ -904,487 +1068,26 @@ class DAQTab(QWidget):
         self._st_state.setStyleSheet(
             f"color:{colors.get(state, PAL['text'])}; font-family:monospace; font-size:8pt;")
 
-    def _on_scan_type_changed(self, idx: int):
-        self._active_scan_idx = idx
-        self._scan_stack.setCurrentIndex(idx)
-
-    def _on_det_changed(self, name: str = ""):
-        name = name or self._det_combo.currentText()
-        kind = detector_kind(name, self._signal_pvs, self._det_pvs)
-        self._det_kind = kind
-        self._det_badge.setText(_AREA_LABELS[kind])
-        self._det_badge.setStyleSheet(
-            f"color:{_AREA_COLORS[kind]}; font-size:8pt; font-style:italic;")
-        if kind == DET_AREA:
-            # Area detectors require HDF5 for image storage
-            self._fmt_combo.setCurrentIndex(0)
-            self._fmt_combo.setEnabled(False)
-            self._log_msg(
-                f"ℹ  Area detector selected — format locked to HDF5.",
-                PAL["warn"])
-        else:
-            self._fmt_combo.setEnabled(True)
-
-    def set_queue_tab(self, qt) -> None:
-        """Wire in the QueueTab for plan submission and live scan display."""
-        self._queue_tab = qt
-        self._queue_btn.setEnabled(True)
-        qt.running_item_changed.connect(self._on_qs_running_item)
-        self._log_msg("Queue server tab connected.", PAL["subtext"])
-
-    # ── Queue-server live display ─────────────────────────────────────────────
-
-    def _qs_arm(self, motor_pv: str, det_pv: str,
-                motor_lbl: str, det_lbl: str,
-                n_steps: int, plan_name: str) -> None:
-        """Subscribe PVs and connect the motor callback so data collection
-        starts immediately — called both from _add_to_queue (before the scan
-        starts) and from _on_qs_running_item (safety net if we missed arm).
-        Safe to call multiple times; connect is a no-op if already connected.
-        """
-        if motor_pv:
-            PVMonitor().subscribe(motor_pv)
-        if det_pv:
-            PVMonitor().subscribe(det_pv)
-
-        self._qs_motor_pv = motor_pv
-        self._qs_det_pv   = det_pv
-        self._qs_n_steps  = n_steps
-        self._qs_last_x   = None   # always reset — prevents initial subscription
-                                   # value from blocking the first scan point
-
-        if not self._qs_active:
-            self._qs_active = True
-            self._qs_t0     = time.monotonic()
-            self._scan_plot.reset(motor_lbl, det_lbl,
-                                  f"QServer: {plan_name}  (waiting…)")
-            self._progress.setMaximum(n_steps if n_steps else 0)
-            self._progress.setValue(0)
-            self._set_state(_ScanState.RUNNING)
-            self._st_file.setText(f"{plan_name} · pending")
-            self._st_file.setStyleSheet(
-                f"color:{PAL['accent']}; font-family:monospace; font-size:8pt;")
-            self._st_point.setText("0" + (f" / {n_steps}" if n_steps else ""))
-            self._st_elapsed.setText("0.0 s")
-            # Disconnect first (in case of stale connection), then reconnect once.
-            try:
-                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
-            except RuntimeError:
-                pass
-            PVMonitor().value_changed.connect(
-                self._on_qs_motor_callback, Qt.UniqueConnection)
-            self._qs_elapsed_timer.start()
-
-    def _on_qs_running_item(self, item: dict) -> None:
-        """Called when the queue server starts or finishes a scan.
-
-        item = full running-item dict when executing, {} when idle/done.
-        """
-        # ── Scan ended ────────────────────────────────────────────────────────
-        if not item:
-            # Always disconnect — don't gate on _qs_active — so stale
-            # connections from _qs_arm never accumulate across scans.
-            try:
-                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
-            except RuntimeError:
-                pass
-            if self._qs_active:
-                self._qs_active = False
-                self._qs_elapsed_timer.stop()
-                elapsed = time.monotonic() - self._qs_t0
-                self._scan_plot.finish("QServer scan complete")
-                self._log_msg(
-                    f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
-                self._write_qs_file()
-                self._set_state(_ScanState.IDLE)
-                self._st_file.setText("—")
-                self._st_file.setStyleSheet(
-                    f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
-                self._qs_pending = {}
-                if self._auto_inc.isChecked():
-                    self._scan_num.setValue(self._scan_num.value() + 1)
-            return
-
-        # ── Scan running — update plot title with real UID ────────────────────
-        plan      = item.get("name", "?")
-        args      = item.get("args", [])
-        uid_short = item.get("item_uid", "")[:8]
-
-        self._log_msg(
-            f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
-
-        # If _qs_arm was already called from _add_to_queue, the callback is live
-        # and data is already flowing.  Update the plot title, reset the
-        # deduplication threshold, and immediately record the current motor
-        # position as the first point (catches the case where the motor was
-        # already at the start position and no callback fired).
-        if self._qs_active:
-            self._scan_plot._ax.set_title(
-                f"QServer: {plan}  (…{uid_short})",
-                color=PAL["text"], fontsize=9)
-            if hasattr(self._scan_plot, "_canvas"):
-                self._scan_plot._canvas.draw_idle()
-            self._st_file.setText(f"{plan} · …{uid_short}")
-            # Reset deduplication so the first callback after this is always recorded
-            self._qs_last_x = None
-            # Immediately sample current motor + detector position
-            self._qs_record_now()
-            return
-
-        # Safety net: _add_to_queue was not the trigger (e.g. scan queued from
-        # another client).  Resolve PVs from the item args and arm now.
-        inv_map = {v: k for k, v in self._device_map.items()}
-
-        def _resolve(devname):
-            friendly = inv_map.get(str(devname), str(devname))
-            pv = (self._motor_pvs.get(friendly)
-                  or self._signal_pvs.get(friendly)
-                  or self._det_pvs.get(friendly)
-                  or "")
-            return friendly, pv
-
-        det_arg   = args[0] if args else ""
-        if isinstance(det_arg, list):
-            det_arg = det_arg[0] if det_arg else ""
-        motor_arg = args[1] if len(args) > 1 else ""
-        n_steps   = int(args[4]) if len(args) > 4 else 0
-
-        motor_lbl, motor_pv = _resolve(motor_arg)
-        det_lbl,   det_pv   = _resolve(det_arg)
-
-        if not motor_pv:
-            motor_lbl = self._motor_combo.currentText()
-            motor_pv  = self._motor_pvs.get(motor_lbl, "")
-            self._log_msg(
-                f"  ⚠ Motor {motor_arg!r} not resolved → {motor_lbl!r}", PAL["warn"])
-        if not det_pv:
-            det_lbl = self._det_combo.currentText()
-            det_pv  = ({**self._signal_pvs, **self._det_pvs}).get(det_lbl, "")
-            self._log_msg(
-                f"  ⚠ Detector {det_arg!r} not resolved → {det_lbl!r}", PAL["warn"])
-
-        self._log_msg(
-            f"  Motor PV: {motor_pv!r}   Detector PV: {det_pv!r}   n_steps={n_steps}",
-            PAL["subtext"])
-
-        self._qs_arm(motor_pv, det_pv, motor_lbl, det_lbl, n_steps, plan)
-        # Update title now we have the UID
-        self._scan_plot._ax.set_title(
-            f"QServer: {plan}  (…{uid_short})", color=PAL["text"], fontsize=9)
-        if hasattr(self._scan_plot, "_canvas"):
-            self._scan_plot._canvas.draw_idle()
-        self._st_file.setText(f"{plan} · …{uid_short}")
-
-    def _on_qs_motor_callback(self, pv_name: str, value) -> None:
-        """Fires on every PVMonitor value_changed event while a QS scan is active.
-
-        Records one (x, y) point each time the motor arrives at a new position.
-        """
-        if not self._qs_active:
-            return
-        if pv_name != self._qs_motor_pv:
-            return
-        if value is None:
-            return
-        try:
-            x = float(value)
-        except (TypeError, ValueError):
-            return
-
-        # Deduplicate: only record when the motor has moved by more than a small
-        # threshold (absorbs settling noise and repeated callbacks at same setpoint).
-        if self._qs_last_x is not None and abs(x - self._qs_last_x) < 1e-6:
-            return
-        self._qs_last_x = x
-
-        # Read detector at this instant
-        if EPICS_AVAILABLE and self._qs_det_pv:
-            raw = PVMonitor().get(self._qs_det_pv)
-            y = float(raw) if raw is not None else float("nan")
-        else:
-            y = sim_scalar([{"_x": x}], len(self._scan_plot._xs))
-
-        self._scan_plot.add_point(x, y)
-
-        n_pts = len(self._scan_plot._xs)
-        n     = self._qs_n_steps
-        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
-        if n:
-            self._progress.setValue(min(n_pts, n))
-
-    def _qs_update_elapsed(self) -> None:
-        """Update the elapsed-time label once per second."""
-        if self._qs_active:
-            self._st_elapsed.setText(f"{time.monotonic() - self._qs_t0:.1f} s")
-
-    def _write_qs_file(self) -> None:
-        """Write the completed QS scan data to a local file.
-
-        Uses the same directory, prefix, format, and scan-number settings
-        as local scans.  The filename gets a 'qs_' prefix so QS-originated
-        files are distinguishable from locally-triggered ones.
-        """
-        xs = list(self._scan_plot._xs)
-        ys = list(self._scan_plot.ys)
-        if not xs:
-            self._log_msg("⚠ QS file: no data points collected — skipping write.",
-                          PAL["warn"])
-            return
-
-        # Build filename — same logic as _current_filename but with 'qs_' prefix
-        d      = self._dir_edit.text().strip() or "."
-        prefix = (self._prefix_edit.text().strip() or "scan") + "_qs"
-        ext    = {0: ".h5", 1: ".csv", 2: ".dat"}.get(
-            self._fmt_combo.currentIndex(), ".csv")
-        if self._rb_ts.isChecked():
-            suffix = datetime.now().strftime("%Y%m%d%H%M%S")
-        else:
-            suffix = f"{self._scan_num.value():04d}"
-        fname = f"{d}/{prefix}_{suffix}{ext}"
-
-        # Motor and detector labels — use whatever the plot axes were set to
-        motor_lbl = self._scan_plot._ax.get_xlabel() or self._qs_motor_pv or "motor"
-        det_lbl   = self._scan_plot._ax.get_ylabel() or self._qs_det_pv   or "detector"
-
-        meta = dict(
-            motor         = motor_lbl,
-            detector      = det_lbl,
-            n_points      = len(xs),
-            start         = xs[0]  if xs else 0,
-            stop          = xs[-1] if xs else 0,
-            scan_num      = self._scan_num.value(),
-            prefix        = prefix,
-            scan_type     = "QServer",
-            det_kind      = self._det_kind,
-            exposure_time = self._p_exp.value(),
-            source        = "bluesky-queueserver",
-        )
-
-        writer = ScanFileWriter()
-        if not writer.open(fname, meta, [det_lbl]):
-            self._log_msg(f"⚠ QS file: could not open {fname}", PAL["nc"])
-            return
-
-        for x, y in zip(xs, ys):
-            writer.write_point(x, y, {det_lbl: y})
-        writer.close()
-
-        self._log_msg(f"💾 QS file written → {fname}", PAL["ok"])
-        self._st_file.setText(Path(fname).name)
-        self._st_file.setStyleSheet(
-            f"color:{PAL['ok']}; font-family:monospace; font-size:8pt;")
-
-        # Also push to Tiled if enabled
-        if self._tiled_chk.isChecked() and PANDAS_AVAILABLE:
-            import pandas as pd
-            df = pd.DataFrame({motor_lbl: xs, det_lbl: ys})
-            general = self._app_cfg.get("general", {})
-            tiled_meta = {
-                **meta,
-                "timestamp":  datetime.now().isoformat(),
-                "facility":   general.get("facility",   "ALS"),
-                "beamline":   general.get("beamline",   "BL601"),
-                "endstation": general.get("endstation", "HiRRIXS"),
-            }
-            ok, msg = self._tiled.write_scan(df, tiled_meta)
-            if ok:
-                self._log_msg(f"🔵 Tiled: written → {msg}", PAL["ok"])
-            else:
-                self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
-
-    def _qs_record_now(self) -> None:
-        """Immediately sample the motor and detector PVs and record a point.
-
-        Called at scan-start confirmation to capture the first position, which
-        may not generate a motor callback if the motor was already there.
-        """
-        if not self._qs_active or not self._qs_motor_pv:
-            return
-        if EPICS_AVAILABLE:
-            raw_x = PVMonitor().get(self._qs_motor_pv)
-            x = float(raw_x) if raw_x is not None else None
-        else:
-            scan      = self._scan_instances[self._active_scan_idx]
-            positions = scan.build_positions()
-            x = positions[0].get("_x") if positions else None
-
-        if x is None:
-            return
-
-        # Use the same deduplication as the callback — _qs_last_x was just
-        # reset to None so this will always pass.
-        if self._qs_last_x is not None and abs(x - self._qs_last_x) < 1e-6:
-            return
-        self._qs_last_x = x
-
-        if EPICS_AVAILABLE and self._qs_det_pv:
-            raw_y = PVMonitor().get(self._qs_det_pv)
-            y = float(raw_y) if raw_y is not None else float("nan")
-        else:
-            y = sim_scalar([{"_x": x}], len(self._scan_plot._xs))
-
-        self._scan_plot.add_point(x, y)
-        n_pts = len(self._scan_plot._xs)
-        n     = self._qs_n_steps
-        self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
-        if n:
-            self._progress.setValue(min(n_pts, n))
-
-
-    def _add_to_queue(self) -> None:
-        """Translate current scan parameters into a bluesky plan and submit."""
-        if self._queue_tab is None:
-            self._log_msg("⚠ Queue tab not connected.", PAL["nc"])
-            return
-
-        scan          = self._scan_instances[self._active_scan_idx]
-        det           = self._det_combo.currentText()
-        exposure_time = self._p_exp.value()
-
-        # ── Resolve device names ───────────────────────────────────────────────
-        det_dev = self._device_map.get(det)
-        if det_dev is None:
-            self._log_msg(
-                f"⚠ No device name found for detector '{det}'. "
-                f"Check devices.py / startup script.", PAL["nc"])
-            return
-
-        x_lbl, _ = scan.plot_axes()
-        motor_dev = self._device_map.get(x_lbl, "")
-
-        # ── Build plan tuple ───────────────────────────────────────────────────
-        try:
-            plan_name, args, kwargs = scan.to_plan(
-                motor_dev, det_dev, exposure_time=exposure_time)
-        except Exception as exc:
-            self._log_msg(f"⚠ Could not build plan: {exc}", PAL["nc"])
-            return
-
-        # ── Resolve Scan2D outer motor sentinel ───────────────────────────────
-        resolved_args = []
-        for a in args:
-            if isinstance(a, str) and a.startswith("__outer__:"):
-                outer_friendly = a[len("__outer__:"):]
-                outer_dev = self._device_map.get(outer_friendly)
-                if outer_dev is None:
-                    self._log_msg(
-                        f"⚠ No device name for outer motor '{outer_friendly}'.",
-                        PAL["nc"])
-                    return
-                resolved_args.append(outer_dev)
-            else:
-                resolved_args.append(a)
-
-        # ── Build metadata ────────────────────────────────────────────────────
-        meta = dict(
-            scan_type     = scan.LABEL,
-            detector      = det,
-            det_kind      = self._det_kind,
-            scan_label    = scan.scan_label(),
-            output_dir    = self._dir_edit.text().strip(),
-            prefix        = self._prefix_edit.text().strip() or "scan",
-            scan_num      = self._scan_num.value(),
-            exposure_time = exposure_time,
-        )
-
-        # ── Submit ────────────────────────────────────────────────────────────
-        ok = self._queue_tab.add_plan(plan_name, resolved_args, kwargs, meta)
-        if ok:
-            self._log_msg(
-                f"✔ Added to queue: {scan.scan_label()}  "
-                f"({exposure_time:.2f} s/pt)", PAL["ok"])
-            # Arm the motor callback immediately so we don't miss early points
-            # when the queue server starts executing before our next poll cycle.
-            motor_pv = self._motor_pvs.get(x_lbl, "")
-            det_pv   = ({**self._signal_pvs, **self._det_pvs}).get(det, "")
-            n_steps  = len(scan.build_positions())
-            self._qs_arm(motor_pv, det_pv, x_lbl, det, n_steps, plan_name)
-
     # ── Scan engine ───────────────────────────────────────────────────────────
     def _start_scan(self):
-        if self._state == _ScanState.RUNNING:
-            return
-
-        scan   = self._scan_instances[self._active_scan_idx]
-        det    = self._det_combo.currentText()
-        kind   = self._det_kind
-        fname  = self._current_filename()
-
-        # Build position sequence
-        positions = scan.build_positions()
-        if not positions:
-            self._log_msg("⚠ No scan positions — check parameters.", PAL["nc"])
-            return
-        self._scan_positions = positions
-        self._scan_idx  = 0
-        self._scan_t0   = time.monotonic()
-        self._acquiring = False
-        self._last_outer = -1
-
-        x_lbl, y_lbl = scan.plot_axes()
-
-        # ── Column list: [det, other signals α, other motors α] ───────────────
-        other_signals = sorted(k for k in self._signal_pvs if k != det)
-        other_motors  = sorted(k for k in self._motor_pvs
-                               if k not in {det, scan.outer_motor()})
-        self._scan_columns = (
-            [det]
-            + [k for k in other_signals if k != det]
-            + [k for k in other_motors  if k != det]
-        )
-
-        # ── Open file ─────────────────────────────────────────────────────────
-        first_pos = positions[0]
-        # Use x-axis label as the "motor" field in metadata
-        meta = dict(
-            scan_type = scan.LABEL,
-            motor     = x_lbl,
-            detector  = det,
-            det_kind  = kind,
-            start     = first_pos["_x"],
-            stop      = positions[-1]["_x"],
-            steps     = len(positions),
-            exposure  = self._p_exp.value(),
-            scan_num  = self._scan_num.value(),
-            prefix    = self._prefix_edit.text().strip() or "scan",
-        )
-        self._writer = ScanFileWriter()
-        if not self._writer.open(fname, meta, self._scan_columns):
-            self._writer = None
-            self._log_msg(f"⚠ Cannot open output file: {fname}", PAL["nc"])
-            from PySide6.QtWidgets import QMessageBox
-            dlg = QMessageBox(self)
-            dlg.setWindowTitle("File Error")
-            dlg.setIcon(QMessageBox.Warning)
-            dlg.setText("Could not open scan output file.")
-            dlg.setInformativeText(
-                f"<b>{Path(fname).name}</b><br><br>"
-                f"Directory: <code>{Path(fname).parent}</code><br><br>"
-                + ("h5py is not installed — run <code>pip install h5py</code> "
-                   "or switch to CSV / SPEC format."
-                   if fname.endswith(".h5") and not H5_AVAILABLE
-                   else "Check that the directory exists and is writable.")
-            )
-            dlg.setStandardButtons(QMessageBox.Abort | QMessageBox.Ignore)
-            dlg.setDefaultButton(QMessageBox.Abort)
-            dlg.setStyleSheet(f"background:{PAL['surface']}; color:{PAL['text']};")
-            if dlg.exec() == QMessageBox.Abort:
-                self._set_state(_ScanState.IDLE)
-                self._reset_run_btns()
-                return
-
-        # ── UI updates ────────────────────────────────────────────────────────
-        n = len(positions)
-        self._scan_plot.reset(x_lbl, det, f"{det}  vs  {x_lbl}")
+        if self._state == _ScanState.RUNNING: return
+        n     = self._p_steps.value()
+        start = self._p_start.value()
+        stop  = self._p_stop.value()
+        step  = (stop - start) / max(n - 1, 1)
+        self._scan_positions = [start + i*step for i in range(n)]
+        self._scan_idx       = 0
+        self._scan_t0        = time.monotonic()
+        fname = self._current_filename()
+        motor = self._motor_combo.currentText()
+        det   = self._det_combo.currentText()
+        self._xas_plot.reset(motor, det, f"{det}  vs  {motor}")
         self._progress.setMaximum(n); self._progress.setValue(0)
         self._st_file.setText(Path(fname).name)
-        self._st_file.setStyleSheet(
-            f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
-        n_extra = len(self._scan_columns) - 1
-        self._log_msg(f"▶ {scan.scan_label()}  →  {fname}", PAL["ok"])
-        self._log_msg(f"   Det: {det} [{kind}]  |  +{n_extra} extra channels"
-                      + (f"  |  area-det timeout: {SCAN_ACQ_TIMEOUT_S:.0f} s"
-                         if kind == DET_AREA else ""))
+        self._st_file.setStyleSheet(f"color:{PAL['text']}; font-family:monospace; font-size:8pt;")
+        self._log_msg(f"▶ Scan started  →  {fname}", PAL["ok"])
+        self._log_msg(f"   Motor: {motor}  |  Det: {det}  |  {n} points  "
+                      f"[{start:.4g} → {stop:.4g}]")
         self._set_state(_ScanState.RUNNING)
         self._run_btn.setEnabled(False)
         self._pause_btn.setEnabled(True); self._abort_btn.setEnabled(True)
@@ -1402,182 +1105,414 @@ class DAQTab(QWidget):
             self._log_msg("▶ Scan resumed.", PAL["ok"])
             self._scan_timer.start(SCAN_DWELL_MS)
 
+    def _abort_scan(self):
+        self._scan_timer.stop()
+        self._set_state(_ScanState.ABORTING)
+        self._log_msg("■ Scan aborted.", PAL["nc"])
+        self._xas_plot.finish("Scan aborted")
+        self._reset_run_btns()
+
     def _scan_step(self):
         if self._state != _ScanState.RUNNING:
             self._scan_timer.stop(); return
-
-        scan = self._scan_instances[self._active_scan_idx]
-        det  = self._det_combo.currentText()
-
-        # ── Poll area-detector completion ─────────────────────────────────────
-        if self._acquiring:
-            base   = self._det_base.get(det, "")
-            rbv_pv = base + ":cam1:Acquire_RBV" if base else ""
-            done   = True
-            if EPICS_AVAILABLE and rbv_pv:
-                raw  = PVMonitor().get(rbv_pv)
-                done = (raw is not None and float(raw) == 0)
-            if not done and time.monotonic() < self._acq_deadline:
-                return          # still acquiring — come back next tick
-            # Acquisition complete (or timed out) → read image, record point
-            y = self._last_area_scalar
-            if not done:
-                self._log_msg(
-                    f"⚠ Area detector timeout at point {self._scan_idx+1}",
-                    PAL["warn"])
-            self._acquiring = False
-            self._record_point(scan, y, det)
-            return
-
-        # ── Advance to next position ──────────────────────────────────────────
         if self._scan_idx >= len(self._scan_positions):
             self._finish_scan(); return
 
-        pos = self._scan_positions[self._scan_idx]
+        x   = self._scan_positions[self._scan_idx]
+        pv  = self._motor_pvs.get(self._motor_combo.currentText(), "")
+        if pv: PVMonitor().put(pv, x)
 
-        # Move all real motors in this step (skip "_"-prefixed keys)
-        for mname, setpoint in pos.items():
-            if mname.startswith("_"): continue
-            pv = self._motor_pvs.get(mname, "")
-            if pv: PVMonitor().put(pv, setpoint)
-
-        # For 2D: reset plot at each new outer step
-        if scan.n_outer() > 1:
-            outer_i = scan.outer_index(self._scan_idx)
-            if outer_i != self._last_outer:
-                x_lbl, _ = scan.plot_axes()
-                om = scan.outer_motor()
-                ov = pos.get(om, outer_i) if om else outer_i
-                om_str = f"{om}={ov:.4g}" if om else f"step {outer_i+1}"
-                self._scan_plot.reset(
-                    x_lbl, det,
-                    f"{det}  vs  {x_lbl}   [{om_str}"
-                    f"  {outer_i+1}/{scan.n_outer()}]")
-                self._last_outer = outer_i
-
-        # ── Acquire detector value ─────────────────────────────────────────────
-        if self._det_kind == DET_AREA:
-            # Trigger acquisition; poll in subsequent ticks
-            base   = self._det_base.get(det, "")
-            acq_pv = base + ":cam1:Acquire" if base else ""
-            if EPICS_AVAILABLE and acq_pv:
-                PVMonitor().put(acq_pv, 1)
-            self._acquiring      = True
-            self._acq_deadline   = time.monotonic() + SCAN_ACQ_TIMEOUT_S
-            self._last_area_scalar = float("nan")   # placeholder for plot
-            return   # don't advance _scan_idx yet; wait for completion
-
-        # Scalar detector: read immediately
-        sig_pv = ({**self._signal_pvs, **self._det_pvs}).get(det, "")
+        # Read detector (simulated if no EPICS)
+        sig_pv = ({**self._signal_pvs, **self._det_pvs}
+                  .get(self._det_combo.currentText(), ""))
         if EPICS_AVAILABLE and sig_pv:
             raw = PVMonitor().get(sig_pv)
             y   = float(raw) if raw is not None else float("nan")
         else:
-            y = sim_scalar(self._scan_positions, self._scan_idx)
+            mid = (self._scan_positions[0] + self._scan_positions[-1]) / 2
+            rng = abs(self._scan_positions[-1] - self._scan_positions[0]) or 1
+            y   = (500 * math.exp(-0.5*((x-mid)/(rng*0.15))**2)
+                   + random.gauss(0, 5))
 
-        self._record_point(scan, y, det)
-
-    def _record_point(self, scan, y: float, det: str):
-        """Advance scan index, update plot, write file row."""
-        pos = self._scan_positions[self._scan_idx]
-        x   = pos["_x"]
-
-        self._scan_plot.add_point(x, y)
-
-        # Read all extra channels
-        extras: dict = {det: y}
-        all_readable = {**self._signal_pvs, **self._det_pvs, **self._motor_pvs}
-        for col in self._scan_columns:
-            if col == det: continue
-            cpv = all_readable.get(col, "")
-            if EPICS_AVAILABLE and cpv:
-                raw = PVMonitor().get(cpv)
-                extras[col] = float(raw) if raw is not None else float("nan")
-            else:
-                extras[col] = float("nan")
-
-        if self._writer is not None:
-            self._writer.write_point(x, y, extras)
-
+        self._xas_plot.add_point(x, y)
         self._scan_idx += 1
         self._progress.setValue(self._scan_idx)
         elapsed = time.monotonic() - self._scan_t0
         self._st_elapsed.setText(f"{elapsed:.1f} s")
-        self._st_point.setText(
-            f"{self._scan_idx} / {len(self._scan_positions)}")
+        self._st_point.setText(f"{self._scan_idx} / {len(self._scan_positions)}")
 
         if self._scan_idx >= len(self._scan_positions):
             self._finish_scan()
 
-
     def _finish_scan(self):
         self._scan_timer.stop()
         fname = self._current_filename()
-        self._scan_plot.finish(f"Scan complete — {Path(fname).name}")
+        self._xas_plot.finish(f"Scan complete — {Path(fname).name}")
         self._log_msg(f"✔ Scan complete.  File: {fname}", PAL["ok"])
-
-        # ── Tiled write ───────────────────────────────────────────────────────
-        if self._tiled_chk.isChecked():
-            self._write_tiled()
-
         if self._auto_inc.isChecked():
             self._scan_num.setValue(self._scan_num.value() + 1)
         self._set_state(_ScanState.IDLE)
-        self._reset_run_btns()
-
-    def _write_tiled(self):
-        """Assemble a DataFrame from the completed scan and push it to Tiled."""
-        if not PANDAS_AVAILABLE:
-            self._log_msg("🔴 Tiled: pandas not installed — cannot build table", PAL["nc"])
-            return
-
-        scan  = self._scan_instances[self._active_scan_idx]
-        x_lbl, _ = scan.plot_axes()
-        motor = x_lbl
-        det   = self._det_combo.currentText()
-
-        # _scan_positions and the y-values collected in _scan_plot are the
-        # canonical source of truth for the completed scan.
-        xs = [p["_x"] for p in self._scan_positions[: self._scan_idx]]
-        ys = list(self._scan_plot.ys)[: self._scan_idx]   # see note below
-
-        if not xs:
-            self._log_msg("🔴 Tiled: no scan data to write", PAL["nc"])
-            return
-
-        df = pd.DataFrame({motor: xs, det: ys})
-
-        general = self._app_cfg.get("general", {})
-        metadata = {
-            "scan_num":   self._scan_num.value(),
-            "motor":      motor,
-            "detector":   det,
-            "start":      xs[0],
-            "stop":       xs[-1],
-            "n_points":   len(xs),
-            "timestamp":  datetime.now().isoformat(),
-            "facility":   general.get("facility",   "ALS"),
-            "beamline":   general.get("beamline",   "BL601"),
-            "endstation": general.get("endstation", "HiRRIXS"),
-        }
-
-        ok, msg = self._tiled.write_scan(df, metadata)
-        if ok:
-            self._log_msg(f"🔵 Tiled: written → {msg}", PAL["ok"])
-        else:
-            self._log_msg(f"🔴 Tiled: {msg}", PAL["nc"])
-
-    def _abort_scan(self):
-        self._scan_timer.stop()
-        self._acquiring = False
-        self._set_state(_ScanState.ABORTING)
-        if self._writer is not None:
-            self._writer.close(aborted=True); self._writer = None
-        self._log_msg("■ Scan aborted.", PAL["nc"])
-        self._scan_plot.finish("Scan aborted")
         self._reset_run_btns()
 
     def _reset_run_btns(self):
         self._run_btn.setEnabled(True)
         self._pause_btn.setEnabled(False); self._pause_btn.setText("⏸  Pause")
         self._abort_btn.setEnabled(False)
+
+    # ── RE controls panel ─────────────────────────────────────────────────────
+    def _build_re_controls(self) -> QGroupBox:
+        grp = QGroupBox("RE Controls"); grp.setStyleSheet(GRP_STYLE)
+        vl = QVBoxLayout(grp); vl.setContentsMargins(8,20,8,8); vl.setSpacing(6)
+
+        def _btn(label, slot):
+            b = QPushButton(label); b.setStyleSheet(BTN_STYLE)
+            b.clicked.connect(slot); return b
+
+        row1 = QHBoxLayout(); row1.setSpacing(4)
+        self._re_start_btn  = _btn("▶  Start Queue", self._re_start)
+        self._re_stop_btn   = _btn("⏹  Stop Queue",  self._re_stop)
+        row1.addWidget(self._re_start_btn)
+        row1.addWidget(self._re_stop_btn)
+        vl.addLayout(row1)
+
+        row2 = QHBoxLayout(); row2.setSpacing(4)
+        self._re_pause_btn  = _btn("⏸  Pause",  self._re_pause)
+        self._re_resume_btn = _btn("▶  Resume", self._re_resume)
+        self._re_abort_btn  = _btn("■  Abort",  self._re_abort)
+        for b in (self._re_pause_btn, self._re_resume_btn, self._re_abort_btn):
+            row2.addWidget(b)
+        vl.addLayout(row2)
+        return grp
+
+    def _re_call(self, method: str, colour: str):
+        qt = getattr(self, "_queue_tab", None)
+        if qt is None:
+            self._log_msg(f"[warn] Queue tab not connected — cannot call {method}", PAL["nc"])
+            return
+        r = qt._api(method)
+        from queue_tab import _result_str, _ts
+        self._log_msg(f"[{_ts()}] {method} → {_result_str(r)}", colour)
+
+    def _re_start(self):  self._re_call("queue_start", PAL["ok"])
+    def _re_stop(self):   self._re_call("queue_stop",  PAL["warn"])
+    def _re_pause(self):  self._re_call("re_pause",    PAL["warn"])
+    def _re_resume(self): self._re_call("re_resume",   PAL["ok"])
+    def _re_abort(self):  self._re_call("re_abort",    PAL["nc"])
+
+    # ── Queue submission ──────────────────────────────────────────────────────
+    def _on_xas_queue(self):
+        qt = getattr(self, "_queue_tab", None)
+        if qt is None:
+            self._log_msg("[warn] Queue tab not connected", PAL["nc"]); return
+        idx = self._xas_scan_combo.currentIndex()
+        if idx < 0 or idx >= len(self._xas_scan_defs):
+            self._log_msg("[warn] No XAS scan selected", PAL["nc"]); return
+        defn = self._xas_scan_defs[idx]
+        from scan_types import XASScan
+        scan = XASScan(defn)
+        det_friendly  = self._det_combo.currentText()
+        det_ophyd     = device_name(det_friendly)
+        motor_ophyd   = device_name(defn.motor)
+        plan_name, args, kwargs = scan.to_plan(
+            motor_ophyd, det_ophyd,
+            exposure_time=getattr(defn, "exposure_time", 1.0))
+        meta = {"scan_name": defn.name, "scan_type": "XAS",
+                "n_points": defn.n_points(), "file": self._current_filename()}
+        ok = qt.add_plan(plan_name, args, kwargs, meta)
+        if ok:
+            self._log_msg(f"✔ XAS '{defn.name}' added to queue  ({defn.n_points()} pts)", PAL["ok"])
+            motor_pv = self._motor_pvs.get(defn.motor, "")
+            det_pv   = ({**self._signal_pvs, **self._det_pvs}).get(det_friendly, "")
+            self._qs_arm(motor_pv, det_pv, defn.motor, det_friendly,
+                         defn.n_points(), plan_name)
+
+    def _on_rixs_queue(self):
+        # Placeholder — RIXS plan submission will be implemented with RIXSScanPlot
+        self._log_msg("[info] RIXS queue submission not yet implemented", PAL["subtext"])
+
+    # ── XAS scan persistence ──────────────────────────────────────────────────
+    def _load_xas_scans(self):
+        try:
+            import json
+            data = json.loads(XAS_SCANS_PATH.read_text())
+            self._xas_scan_defs = [XASScanDef.from_dict(d) for d in data]
+        except Exception:
+            self._xas_scan_defs = []
+
+    def _save_xas_scans(self):
+        try:
+            import json
+            XAS_SCANS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            XAS_SCANS_PATH.write_text(
+                json.dumps([d.to_dict() for d in self._xas_scan_defs], indent=2))
+        except Exception as e:
+            self._log_msg(f"[warn] Could not save XAS scans: {e}", PAL["warn"])
+
+    def _refresh_xas_combo(self):
+        self._xas_scan_combo.blockSignals(True)
+        self._xas_scan_combo.clear()
+        for d in self._xas_scan_defs:
+            self._xas_scan_combo.addItem(d.name)
+        self._xas_scan_combo.blockSignals(False)
+        self._on_xas_scan_selected(self._xas_scan_combo.currentIndex())
+
+    def _on_new_xas_scan(self):
+        dlg = XASScanDialog(
+            motor_names=list(self._motor_pvs.keys()),
+            default_motor=self._xas_default_motor,
+            parent=self,
+        )
+        if dlg.exec() == QDialog.Accepted and dlg.result_def():
+            defn = dlg.result_def()
+            self._xas_scan_defs.append(defn)
+            self._save_xas_scans()
+            self._refresh_xas_combo()
+            self._xas_scan_combo.setCurrentIndex(len(self._xas_scan_defs) - 1)
+
+    def _on_edit_xas_scan(self):
+        idx = self._xas_scan_combo.currentIndex()
+        if idx < 0 or idx >= len(self._xas_scan_defs):
+            return
+        dlg = XASScanDialog(
+            motor_names=list(self._motor_pvs.keys()),
+            default_motor=self._xas_default_motor,
+            existing=self._xas_scan_defs[idx],
+            parent=self,
+        )
+        if dlg.exec() == QDialog.Accepted and dlg.result_def():
+            self._xas_scan_defs[idx] = dlg.result_def()
+            self._save_xas_scans()
+            self._refresh_xas_combo()
+            self._xas_scan_combo.setCurrentIndex(idx)
+
+    def _on_delete_xas_scan(self):
+        idx = self._xas_scan_combo.currentIndex()
+        if idx < 0 or idx >= len(self._xas_scan_defs):
+            return
+        name = self._xas_scan_defs[idx].name
+        reply = QMessageBox.question(
+            self, "Delete scan",
+            f"Delete '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            del self._xas_scan_defs[idx]
+            self._save_xas_scans()
+            self._refresh_xas_combo()
+
+    def _on_xas_scan_selected(self, idx: int):
+        if idx < 0 or idx >= len(self._xas_scan_defs):
+            self._xas_info_lbl.setText("No scan selected")
+            return
+        d = self._xas_scan_defs[idx]
+        lo  = min(sr.start for sr in d.subranges)
+        hi  = max(sr.stop  for sr in d.subranges)
+        exp = getattr(d, "exposure_time", 1.0)
+        self._xas_info_lbl.setText(
+            f"{d.motor}  [{lo:.3f} → {hi:.3f} eV]  "
+            f"{len(d.subranges)} range(s)  ·  {d.n_points()} pts  ·  "
+            f"{exp:.2f} s/pt")
+
+    # ── RIXS excitation energy list management ────────────────────────────────
+    def _refresh_rixs_energy_lists(self):
+        """Sync both the XAS-panel list and the RIXS-panel read-only list."""
+        for lw in (self._rixs_energy_list,
+                   getattr(self, "_rixs_from_xas_list", None)):
+            if lw is None:
+                continue
+            lw.clear()
+            for e in self._rixs_energies:
+                lw.addItem(QListWidgetItem(f"{e:.4f} eV"))
+
+    def _on_add_rixs_point(self):
+        """Add the current XAS cursor x-position to the RIXS energy list."""
+        txt = self._xas_plot._ro_pos.text().strip()
+        if txt == "—" or not txt:
+            self._log_msg("[warn] No XAS cursor position — hold left mouse button "
+                          "over the XAS plot to set cursor.", PAL["warn"])
+            return
+        try:
+            energy = float(txt)
+        except ValueError:
+            self._log_msg(f"[warn] Could not parse cursor position: {txt!r}", PAL["warn"])
+            return
+        if energy not in self._rixs_energies:
+            self._rixs_energies.append(energy)
+            self._rixs_energies.sort()
+            self._refresh_rixs_energy_lists()
+            self._log_msg(f"RIXS point added: {energy:.4f} eV  "
+                          f"({len(self._rixs_energies)} total)", PAL["ok"])
+        else:
+            self._log_msg(f"[info] {energy:.4f} eV already in RIXS list", PAL["subtext"])
+
+    def _on_delete_rixs_point(self):
+        """Delete the selected energy from the RIXS excitation energy list."""
+        row = self._rixs_energy_list.currentRow()
+        if row < 0 or row >= len(self._rixs_energies):
+            return
+        energy = self._rixs_energies.pop(row)
+        self._refresh_rixs_energy_lists()
+        self._log_msg(f"RIXS point removed: {energy:.4f} eV", PAL["subtext"])
+
+    # ── XAS scan control panel ────────────────────────────────────────────────
+    def _build_xas_panel(self):
+        grp = QGroupBox("XAS Scan"); grp.setStyleSheet(GRP_STYLE)
+        vl = QVBoxLayout(grp); vl.setContentsMargins(8,20,8,8); vl.setSpacing(8)
+
+        def ql(t):
+            lb = QLabel(t); lb.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+            return lb
+
+        # ── New / Edit / Delete scan buttons ─────────────────────────────────
+        scan_mgmt_row = QHBoxLayout(); scan_mgmt_row.setSpacing(4)
+        new_scan_btn  = QPushButton("New");    new_scan_btn.setStyleSheet(BTN_STYLE)
+        edit_scan_btn = QPushButton("Edit");   edit_scan_btn.setStyleSheet(BTN_STYLE)
+        del_scan_btn  = QPushButton("Delete"); del_scan_btn.setStyleSheet(BTN_STYLE)
+        new_scan_btn.clicked.connect(self._on_new_xas_scan)
+        edit_scan_btn.clicked.connect(self._on_edit_xas_scan)
+        del_scan_btn.clicked.connect(self._on_delete_xas_scan)
+        for b in (new_scan_btn, edit_scan_btn, del_scan_btn):
+            scan_mgmt_row.addWidget(b)
+        vl.addLayout(scan_mgmt_row)
+
+        # ── Scan selector combo ───────────────────────────────────────────────
+        vl.addWidget(ql("Saved scans"))
+        self._xas_scan_combo = QComboBox(); self._xas_scan_combo.setStyleSheet(COMBO_STYLE)
+        self._xas_scan_combo.currentIndexChanged.connect(self._on_xas_scan_selected)
+        vl.addWidget(self._xas_scan_combo)
+
+        # Info label showing selected scan summary
+        self._xas_info_lbl = QLabel("No scan selected")
+        self._xas_info_lbl.setStyleSheet(
+            f"color:{PAL['subtext']}; font-size:7pt; padding:2px 0;")
+        self._xas_info_lbl.setWordWrap(True)
+        vl.addWidget(self._xas_info_lbl)
+
+        # Populate combo from already-loaded scans
+        self._refresh_xas_combo()
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep)
+
+        # Queue / Pause / Abort
+        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
+        self._xas_queue_btn = QPushButton("+ Queue"); self._xas_queue_btn.setStyleSheet(BTN_STYLE)
+        self._xas_pause_btn = QPushButton("Pause");   self._xas_pause_btn.setStyleSheet(BTN_STYLE)
+        self._xas_abort_btn = QPushButton("Abort");   self._xas_abort_btn.setStyleSheet(BTN_STYLE)
+        self._xas_queue_btn.clicked.connect(self._on_xas_queue)
+        for b in (self._xas_queue_btn, self._xas_pause_btn, self._xas_abort_btn):
+            btn_row.addWidget(b)
+        vl.addLayout(btn_row)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep2)
+
+        # ── RIXS excitation energy list ───────────────────────────────────────
+        vl.addWidget(ql("RIXS excitation energies"))
+
+        self._rixs_energy_list = QListWidget()
+        self._rixs_energy_list.setStyleSheet(f"""
+            QListWidget {{
+                background:{PAL['surface']}; color:{PAL['text']};
+                border:1px solid #2a3a5e; font-family:monospace; font-size:8pt;
+            }}
+            QListWidget::item:selected {{ background:#1e3a5e; }}
+        """)
+        self._rixs_energy_list.setMaximumHeight(100)
+        self._rixs_energy_list.setSelectionMode(QListWidget.SingleSelection)
+        vl.addWidget(self._rixs_energy_list)
+
+        rixs_pt_row = QHBoxLayout(); rixs_pt_row.setSpacing(4)
+        add_rixs_btn = QPushButton("Add RIXS Point")
+        add_rixs_btn.setStyleSheet(BTN_STYLE)
+        add_rixs_btn.setToolTip("Add current XAS cursor position to RIXS excitation energy list")
+        add_rixs_btn.clicked.connect(self._on_add_rixs_point)
+        del_rixs_btn = QPushButton("Delete RIXS Point")
+        del_rixs_btn.setStyleSheet(BTN_STYLE)
+        del_rixs_btn.setToolTip("Delete selected energy from RIXS excitation energy list")
+        del_rixs_btn.clicked.connect(self._on_delete_rixs_point)
+        rixs_pt_row.addWidget(add_rixs_btn)
+        rixs_pt_row.addWidget(del_rixs_btn)
+        vl.addLayout(rixs_pt_row)
+
+        vl.addStretch()
+        return grp
+
+    # ── RIXS scan control panel ───────────────────────────────────────────────
+    def _build_rixs_panel(self):
+        grp = QGroupBox("RIXS Scan"); grp.setStyleSheet(GRP_STYLE)
+        vl = QVBoxLayout(grp); vl.setContentsMargins(8,20,8,8); vl.setSpacing(8)
+
+        def ql(t):
+            lb = QLabel(t); lb.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+            return lb
+
+        # Excitation energy button
+        exc_btn = QPushButton("Excitation energy"); exc_btn.setStyleSheet(BTN_STYLE)
+        vl.addWidget(exc_btn)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep)
+
+        # Mode radio buttons (mutually exclusive)
+        self._rixs_mode_grp = QButtonGroup(self)
+        mode_row = QHBoxLayout(); mode_row.setSpacing(10)
+        for label, attr in (("One", "_rixs_one"), ("Map", "_rixs_map"), ("From XAS", "_rixs_from_xas")):
+            rb = QRadioButton(label); rb.setStyleSheet(RADIO_STYLE)
+            self._rixs_mode_grp.addButton(rb)
+            setattr(self, attr, rb)
+            mode_row.addWidget(rb)
+        self._rixs_one.setChecked(True)
+        vl.addLayout(mode_row)
+
+        # From XAS energy list — shown only when "From XAS" is selected
+        self._rixs_from_xas_list = QListWidget()
+        self._rixs_from_xas_list.setStyleSheet(f"""
+            QListWidget {{
+                background:{PAL['surface']}; color:{PAL['text']};
+                border:1px solid #2a3a5e; font-family:monospace; font-size:8pt;
+            }}
+            QListWidget::item:selected {{ background:#1e3a5e; }}
+        """)
+        self._rixs_from_xas_list.setMaximumHeight(90)
+        self._rixs_from_xas_list.setSelectionMode(QListWidget.NoSelection)
+        self._rixs_from_xas_list.setVisible(False)
+        vl.addWidget(self._rixs_from_xas_list)
+
+        def _on_mode_changed():
+            self._rixs_from_xas_list.setVisible(self._rixs_from_xas.isChecked())
+
+        self._rixs_from_xas.toggled.connect(_on_mode_changed)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.HLine)
+        sep2.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep2)
+
+        # Start / Stop / Size spinboxes
+        gl = QGridLayout(); gl.setSpacing(6)
+        for row, (lbl, attr, val, lo, hi, dec) in enumerate([
+            ("Start", "_rixs_start", 250.0, 0.0, 10000.0, 3),
+            ("Stop",  "_rixs_stop",  270.0, 0.0, 10000.0, 3),
+            ("Size",  "_rixs_size",   0.5,  0.0,  1000.0, 4),
+        ]):
+            gl.addWidget(ql(lbl), row, 0)
+            sp = QDoubleSpinBox(); sp.setRange(lo, hi); sp.setValue(val)
+            sp.setDecimals(dec); sp.setStyleSheet(SPIN_STYLE)
+            setattr(self, attr, sp); gl.addWidget(sp, row, 1)
+        vl.addLayout(gl)
+
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.HLine)
+        sep3.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep3)
+
+        # Queue / Pause / Abort
+        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
+        self._rixs_queue_btn = QPushButton("+ Queue"); self._rixs_queue_btn.setStyleSheet(BTN_STYLE)
+        self._rixs_pause_btn = QPushButton("Pause");   self._rixs_pause_btn.setStyleSheet(BTN_STYLE)
+        self._rixs_abort_btn = QPushButton("Abort");   self._rixs_abort_btn.setStyleSheet(BTN_STYLE)
+        self._rixs_queue_btn.clicked.connect(self._on_rixs_queue)
+        for b in (self._rixs_queue_btn, self._rixs_pause_btn, self._rixs_abort_btn):
+            btn_row.addWidget(b)
+        vl.addLayout(btn_row)
+
+        vl.addStretch()
+        return grp

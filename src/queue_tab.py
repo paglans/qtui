@@ -120,6 +120,7 @@ class _QSPoller(QThread):
     # Payload: full item dict while a scan is executing, {} when idle.
     running_item_changed = Signal(dict)
 
+
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)
         self._cfg      = cfg
@@ -207,8 +208,6 @@ class _QSPoller(QThread):
             self.history_updated.emit(history.get("items", []))
 
             # Detect running-item changes.
-            # running_item is a field in the queue_get() response (not status()).
-            # It contains the full item dict while executing, or {} when idle.
             running_item: dict = q.get("running_item") or {}
             uid: str = running_item.get("item_uid", "")
             if uid != self._last_running_uid:
@@ -246,7 +245,7 @@ class QueueTab(QWidget):
         Connect from DAQTab via set_queue_tab().
     """
 
-    running_item_changed = Signal(dict)
+    running_item_changed  = Signal(dict)
 
     def __init__(self, qs_cfg: dict, parent=None):
         super().__init__(parent)

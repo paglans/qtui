@@ -424,8 +424,115 @@ class TimeScan(BaseScan):
             {"delay": delay, "exposure_time": exposure_time},
         )
 
+# ══════════════════════════════════════════════════════════════════════════════
+# XAS Scan  (variable step size, named, saved to disk)
+# ══════════════════════════════════════════════════════════════════════════════
+from dataclasses import dataclass, field, asdict
+
+
+@dataclass
+class XASSubrange:
+    """One contiguous segment of an XAS scan with a fixed step size."""
+    start    : float = 250.0
+    stop     : float = 270.0
+    step_size: float = 0.5
+
+    def positions(self) -> list[float]:
+        """Expand subrange into individual energy positions."""
+        if self.step_size <= 0:
+            return [self.start]
+        n = max(2, round(abs(self.stop - self.start) / self.step_size) + 1)
+        return _linspace(self.start, self.stop, n)
+
+    def n_points(self) -> int:
+        return len(self.positions())
+
+
+@dataclass
+class XASScanDef:
+    """A named XAS scan definition composed of one or more subranges."""
+    name          : str               = "New XAS Scan"
+    motor         : str               = "MonoEnergy"
+    exposure_time : float             = 1.0
+    subranges     : list[XASSubrange] = field(default_factory=lambda: [XASSubrange()])
+
+    def all_positions(self) -> list[float]:
+        """Merge subranges, removing duplicate boundary points."""
+        pts: list[float] = []
+        for sr in self.subranges:
+            new = sr.positions()
+            if pts and new and abs(new[0] - pts[-1]) < 1e-9:
+                new = new[1:]
+            pts.extend(new)
+        return pts
+
+    def n_points(self) -> int:
+        return len(self.all_positions())
+
+    def to_dict(self) -> dict:
+        return {
+            "name"         : self.name,
+            "motor"        : self.motor,
+            "exposure_time": self.exposure_time,
+            "subranges"    : [asdict(sr) for sr in self.subranges],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "XASScanDef":
+        return cls(
+            name          = d.get("name", "XAS Scan"),
+            motor         = d.get("motor", "MonoEnergy"),
+            exposure_time = float(d.get("exposure_time", 1.0)),
+            subranges     = [XASSubrange(**sr) for sr in d.get("subranges", [])],
+        )
+
+
+class XASScan(BaseScan):
+    """XAS scan driven by a saved :class:`XASScanDef`."""
+    LABEL = "XAS Scan"
+
+    def __init__(self, defn: "XASScanDef | None" = None):
+        self._defn: XASScanDef = defn or XASScanDef()
+
+    def set_definition(self, defn: XASScanDef):
+        self._defn = defn
+
+    def build_widget(self, motor_names: list[str]) -> QWidget:
+        # XASScan is driven from the panel combo, not an inline widget
+        ph = QWidget()
+        lbl = QLabel(f"XAS: {self._defn.name}  ({self._defn.n_points()} pts)")
+        lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
+        from PySide6.QtWidgets import QVBoxLayout
+        QVBoxLayout(ph).addWidget(lbl)
+        return ph
+
+    def build_positions(self) -> list[dict]:
+        m = self._defn.motor
+        return [{"_x": e, m: e} for e in self._defn.all_positions()]
+
+    def plot_axes(self) -> tuple[str, str]:
+        return (f"{self._defn.motor} (eV)", "detector")
+
+    def scan_label(self) -> str:
+        d = self._defn
+        pts = d.n_points()
+        lo  = min(sr.start for sr in d.subranges)
+        hi  = max(sr.stop  for sr in d.subranges)
+        return f"XAS '{d.name}'  {d.motor}  [{lo:.3f} → {hi:.3f} eV]  {pts} pts"
+
+    def to_plan(self, motor_dev: str, det_dev: str,
+                exposure_time: float | None = None) -> tuple[str, list, dict]:
+        positions = self._defn.all_positions()
+        exp = exposure_time if exposure_time is not None else self._defn.exposure_time
+        return (
+            "xas_scan",
+            [[det_dev], motor_dev, positions],
+            {"exposure_time": exp},
+        )
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
-ALL_SCAN_TYPES: list[type[BaseScan]] = [Scan1D, Scan2D, TimeScan]
+ALL_SCAN_TYPES: list[type[BaseScan]] = [Scan1D, Scan2D, TimeScan, XASScan]
 
 
 # ── Simulation helper ─────────────────────────────────────────────────────────

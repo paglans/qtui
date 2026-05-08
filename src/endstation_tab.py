@@ -15,7 +15,8 @@ from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QPen, QCursor, QDoub
 
 from common import (
     PAL, COMBO_STYLE, BTN_STYLE, GRP_STYLE, INPUT_STYLE, SPLITTER_STYLE,
-    MPL_AVAILABLE, PVMonitor, PVLabel, fill_table,
+    MPL_AVAILABLE, PVA_AVAILABLE, PVMonitor, PVLabel, fill_table,
+    _PVABridge, DetectorImageViewer,
 )
 from beamline_tab import ScanWindow
 
@@ -24,12 +25,6 @@ if MPL_AVAILABLE:
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
     from matplotlib.figure import Figure
-
-try:
-    from p4p.client.thread import Context as PVAContext
-    PVA_AVAILABLE = True
-except ImportError:
-    PVA_AVAILABLE = False
 
 HISTORY = 200
 
@@ -56,7 +51,7 @@ class LiveChart(QWidget):
             ph = QLabel("matplotlib not installed"); ph.setAlignment(Qt.AlignCenter)
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             vl.addWidget(ph)
-        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
+        PVMonitor().value_changed.connect(self._on_pv)
 
     def set_x_pv(self, pv): self._x_pv=pv; self._x_val=None; self._clear()
     def set_y_pv(self, pv): self._y_pv=pv; self._y_val=None; self._clear()
@@ -95,300 +90,6 @@ class LiveChart(QWidget):
             if MPL_AVAILABLE:
                 self._line.set_data(list(self._x_buf), list(self._y_buf))
                 self._ax.relim(); self._ax.autoscale_view(); self._canvas.draw_idle()
-
-
-# ── PVA image bridge ──────────────────────────────────────────────────────────
-class _PVABridge(QObject):
-    new_frame = Signal(object)
-    MIN_INTERVAL_MS = 200
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._ctx  : "PVAContext | None" = None
-        self._sub  = None
-        self._last_emit = 0.0
-
-    def subscribe(self, pv_name: str):
-        self._cancel()
-        if not PVA_AVAILABLE or not pv_name:
-            return
-        self._pending = pv_name
-        import threading
-        threading.Thread(target=self._connect, args=(pv_name,), daemon=True).start()
-
-    def _connect(self, pv_name: str):
-        try:
-            if self._ctx is None:
-                self._ctx = PVAContext("pva", nt=False)
-            if getattr(self, "_pending", None) != pv_name:
-                return
-            self._sub = self._ctx.monitor(pv_name, self._cb, notify_disconnect=True)
-        except Exception as e:
-            print(f"[PVABridge] subscribe error: {e}")
-
-    def _cb(self, value):
-        if isinstance(value, Exception):
-            return
-        import time
-        now = time.monotonic()
-        if (now - self._last_emit) * 1000 < self.MIN_INTERVAL_MS:
-            return
-        try:
-            import numpy as np
-            raw  = np.asarray(value.value, dtype=float)
-            dims = value.dimension
-            if len(dims) < 2: return
-            ny = int(dims[0].size); nx = int(dims[1].size)
-            if nx * ny == 0: return
-            img = raw[: ny * nx].reshape(ny, nx)
-            self._last_emit = now
-            self.new_frame.emit(img)
-        except Exception as e:
-            print(f"[PVABridge] frame error: {e}")
-
-    def _cancel(self):
-        if self._sub is not None:
-            try: self._sub.close()
-            except: pass
-            self._sub = None
-
-    def close(self):
-        self._cancel()
-        if self._ctx is not None:
-            try: self._ctx.close()
-            except: pass
-            self._ctx = None
-
-
-# ── Detector Image Viewer ─────────────────────────────────────────────────────
-class DetectorImageViewer(QWidget):
-    _CMAPS   = ["viridis", "inferno", "gray", "plasma", "hot"]
-    _IMG_SUF = ":RawImg"
-    _ACQ_SUF = ":cam1:Acquire"
-    _ACQ_RBV = ":cam1:Acquire_RBV"
-
-    def __init__(self, detector_pvs: dict, parent=None):
-        super().__init__(parent)
-        self._det_pvs  = detector_pvs
-        self._img_data : "np.ndarray | None" = None
-        self._auto     = True
-        self._cmap     = "viridis"
-        self._im       = None
-        self._cbar     = None
-
-        self.setStyleSheet(f"background:{PAL['bg']};")
-        vl = QVBoxLayout(self); vl.setContentsMargins(4,4,4,4); vl.setSpacing(4)
-
-        tb = QHBoxLayout(); tb.setSpacing(8)
-        lbl = QLabel("Detector")
-        lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
-        tb.addWidget(lbl)
-        self._det_combo = QComboBox(); self._det_combo.setStyleSheet(COMBO_STYLE)
-        self._det_combo.setFixedWidth(140)
-        for name in self._det_pvs: self._det_combo.addItem(name)
-        self._det_combo.currentTextChanged.connect(self._on_det_changed)
-        tb.addWidget(self._det_combo)
-
-        tb.addSpacing(8)
-        lbl2 = QLabel("Colormap")
-        lbl2.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
-        tb.addWidget(lbl2)
-        self._cmap_combo = QComboBox(); self._cmap_combo.setStyleSheet(COMBO_STYLE)
-        self._cmap_combo.setFixedWidth(90)
-        for cm in self._CMAPS: self._cmap_combo.addItem(cm)
-        self._cmap_combo.currentTextChanged.connect(self._on_cmap_changed)
-        tb.addWidget(self._cmap_combo)
-
-        self._auto_btn = QPushButton("Auto ✓")
-        self._auto_btn.setStyleSheet(BTN_STYLE)
-        self._auto_btn.setFixedWidth(68)
-        self._auto_btn.setCheckable(True); self._auto_btn.setChecked(True)
-        self._auto_btn.toggled.connect(self._on_auto_toggled)
-        tb.addWidget(self._auto_btn)
-
-        self._acq_btn = QPushButton("▶ Acquire")
-        self._acq_btn.setStyleSheet(BTN_STYLE)
-        self._acq_btn.setFixedWidth(90)
-        self._acq_btn.setCheckable(True)
-        self._acq_btn.toggled.connect(self._on_acq_toggled)
-        tb.addWidget(self._acq_btn)
-
-        self._pva_lbl = QLabel("PVA: —")
-        self._pva_lbl.setFont(QFont("Monospace", 7))
-        self._pva_lbl.setStyleSheet(f"color:{PAL['subtext']};")
-        tb.addWidget(self._pva_lbl)
-        tb.addStretch()
-        vl.addLayout(tb)
-
-        if MPL_AVAILABLE:
-            self._fig = Figure(facecolor=PAL["bg"])
-            self._fig.subplots_adjust(left=0.1, right=0.85, top=0.92, bottom=0.1)
-            self._ax  = self._fig.add_subplot(111)
-            self._ch_v = self._ax.axvline(x=0, color="white", lw=0.7, ls="--", visible=False)
-            self._ch_h = self._ax.axhline(y=0, color="white", lw=0.7, ls="--", visible=False)
-            self._style_ax()
-            self._canvas = FigureCanvas(self._fig)
-            self._canvas.setStyleSheet("background:transparent;")
-            self._canvas.mpl_connect("motion_notify_event", self._on_mouse_move)
-            self._canvas.mpl_connect("axes_leave_event",    self._on_axes_leave)
-            self._nav = NavToolbar(self._canvas, self)
-            self._nav.setStyleSheet(
-                f"background:{PAL['surface']}; color:{PAL['text']};"
-                f"border:none; font-size:8pt;")
-            vl.addWidget(self._nav)
-            vl.addWidget(self._canvas, 1)
-        else:
-            ph = QLabel("matplotlib not installed")
-            ph.setAlignment(Qt.AlignCenter)
-            ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
-            vl.addWidget(ph, 1)
-
-        self._status = QLabel("No image")
-        self._status.setFont(QFont("Monospace", 7))
-        self._status.setStyleSheet(f"color:{PAL['subtext']}; padding:2px 4px;")
-        vl.addWidget(self._status)
-
-        self._bridge = _PVABridge(self)
-        self._bridge.new_frame.connect(self._on_frame)
-        self._mon = PVMonitor()
-        self._mon.value_changed.connect(self._sync_acq_rbv, Qt.UniqueConnection)
-
-        if PVA_AVAILABLE:
-            self._pva_lbl.setText("PVA: ok")
-            self._pva_lbl.setStyleSheet(f"color:{PAL['ok']}; font-size:7pt;")
-            if self._det_pvs:
-                first = next(iter(self._det_pvs))
-                QTimer.singleShot(500, lambda: self._on_det_changed(first))
-        else:
-            self._pva_lbl.setText("PVA: missing")
-            self._pva_lbl.setStyleSheet(f"color:{PAL['nc']}; font-size:7pt;")
-            self._sim_timer = QTimer(self)
-            self._sim_timer.timeout.connect(self._push_sim_frame)
-            self._sim_timer.start(2000)
-            self._push_sim_frame()
-
-    def closeEvent(self, ev):
-        self._bridge.close(); super().closeEvent(ev)
-
-    def _style_ax(self):
-        ax = self._ax; ax.set_facecolor(PAL["bg"])
-        for sp in ax.spines.values(): sp.set_color("#2a3a5e")
-        ax.tick_params(colors=PAL["subtext"], labelsize=6)
-        ax.set_title("No image loaded", color=PAL["subtext"], fontsize=8)
-
-    def _on_det_changed(self, name: str):
-        prefix = self._det_pvs.get(name, "")
-        pv = prefix + self._IMG_SUF if prefix else ""
-        self._img_data = None; self._im = None
-        if self._cbar is not None:
-            try: self._cbar.remove()
-            except: pass
-            self._cbar = None
-        if MPL_AVAILABLE:
-            self._ax.cla(); self._style_ax(); self._canvas.draw_idle()
-        self._acq_btn.blockSignals(True)
-        self._acq_btn.setChecked(False)
-        self._acq_btn.setText("▶ Acquire")
-        self._acq_btn.setStyleSheet(BTN_STYLE)
-        self._acq_btn.blockSignals(False)
-        if prefix:
-            self._mon.subscribe(prefix + self._ACQ_RBV)
-            self._bridge.subscribe(pv)
-            self._status.setText(f"Monitoring  {pv} …")
-        else:
-            self._status.setText("No PV configured for this detector")
-
-    def _on_cmap_changed(self, cmap: str):
-        self._cmap = cmap
-        if self._im is not None and MPL_AVAILABLE:
-            self._im.set_cmap(cmap); self._canvas.draw_idle()
-
-    def _on_auto_toggled(self, checked: bool):
-        self._auto = checked
-        self._auto_btn.setText("Auto ✓" if checked else "Auto ✗")
-        if checked and self._img_data is not None:
-            self._render(self._img_data)
-
-    def _on_acq_toggled(self, checked: bool):
-        prefix = self._det_pvs.get(self._det_combo.currentText(), "")
-        if not prefix: return
-        pv = prefix + self._ACQ_SUF
-        val = 1 if checked else 0
-        self._acq_btn.setText("■ Stop" if checked else "▶ Acquire")
-        self._acq_btn.setStyleSheet(
-            BTN_STYLE.replace("background:#1a2a4a", "background:#7a1a1a") if checked
-            else BTN_STYLE)
-        try:
-            import epics; epics.caput(pv, val)
-        except ImportError:
-            print(f"[SIM] caput {pv} = {val}")
-
-    def _sync_acq_rbv(self, name: str, value):
-        prefix = self._det_pvs.get(self._det_combo.currentText(), "")
-        if not prefix or name != prefix + self._ACQ_RBV: return
-        try: acquiring = bool(int(value))
-        except (TypeError, ValueError): return
-        self._acq_btn.blockSignals(True)
-        self._acq_btn.setChecked(acquiring)
-        self._acq_btn.setText("■ Stop" if acquiring else "▶ Acquire")
-        self._acq_btn.setStyleSheet(
-            BTN_STYLE.replace("background:#1a2a4a", "background:#7a1a1a") if acquiring
-            else BTN_STYLE)
-        self._acq_btn.blockSignals(False)
-
-    def _on_frame(self, img: "np.ndarray"):
-        det = self._det_combo.currentText()
-        h, w = img.shape
-        self._status.setText(f"{det}  {w}×{h}  —  move mouse over image for pixel value")
-        self._render(img)
-
-    def _on_mouse_move(self, ev):
-        if ev.inaxes is not self._ax or self._img_data is None: return
-        col, row = int(ev.xdata + 0.5), int(ev.ydata + 0.5)
-        h, w = self._img_data.shape
-        if 0 <= col < w and 0 <= row < h:
-            val = self._img_data[row, col]
-            self._ch_v.set_xdata([col]); self._ch_v.set_visible(True)
-            self._ch_h.set_ydata([row]); self._ch_h.set_visible(True)
-            self._canvas.draw_idle()
-            self._status.setText(f"col={col}  row={row}  value={val:.4g}")
-
-    def _on_axes_leave(self, _ev):
-        self._ch_v.set_visible(False); self._ch_h.set_visible(False)
-        if MPL_AVAILABLE: self._canvas.draw_idle()
-
-    def _render(self, img: "np.ndarray"):
-        if not MPL_AVAILABLE: return
-        self._img_data = img
-        if self._im is None:
-            self._im = self._ax.imshow(img, origin="lower", aspect="equal",
-                                       cmap=self._cmap, interpolation="nearest")
-            self._cbar = self._fig.colorbar(self._im, ax=self._ax,
-                                            fraction=0.046, pad=0.04)
-            self._cbar.ax.tick_params(colors=PAL["subtext"], labelsize=6)
-            self._cbar.outline.set_edgecolor("#2a3a5e")
-            self._ax.add_line(self._ch_v); self._ax.add_line(self._ch_h)
-        else:
-            self._im.set_data(img); self._im.set_cmap(self._cmap)
-        if self._auto: self._im.autoscale()
-        h, w = img.shape
-        self._ax.set_title(f"{self._det_combo.currentText()}  —  {w}×{h}",
-                           color=PAL["text"], fontsize=8)
-        self._canvas.draw_idle()
-
-    def _push_sim_frame(self):
-        if not MPL_AVAILABLE: return
-        N = 256
-        y, x = np.ogrid[:N, :N]
-        cx = N/2 + np.random.uniform(-3, 3); cy = N/2 + np.random.uniform(-3, 3)
-        r = np.hypot(x - cx, y - cy)
-        img = np.zeros((N, N), dtype=float)
-        for r0, bw, A in [(40,4,800),(70,6,600),(100,5,400),(130,7,250)]:
-            img += A * np.exp(-0.5*((r-r0)/bw)**2)
-        img += np.random.normal(scale=15, size=img.shape)
-        img  = np.clip(img, 0, None)
-        self._status.setText(f"[SIM]  {self._det_combo.currentText() or 'simDetector'}  {N}×{N}")
-        self._render(img)
 
 
 # ── PV overlay widget ─────────────────────────────────────────────────────────
@@ -433,7 +134,7 @@ class _PVOverlayWidget(QWidget):
         self._eff.setOpacity(0.35)
         self.setGraphicsEffect(self._eff)
 
-        PVMonitor().value_changed.connect(self._on_pv, Qt.UniqueConnection)
+        PVMonitor().value_changed.connect(self._on_pv)
         PVMonitor().subscribe(rbv_pv)
         self._rbv_pv = rbv_pv
 
@@ -470,7 +171,7 @@ _REGIONS = [
     ("Optics",      1260,  915,  550, 200, ["SpectOpticsHeight", "SpectOpticsPitch",
                                             "SpectOpticsRoll"]),
     ("Grating",     1560,  490,  555, 200, ["GratingAngle"]),
-    ("Detector",    1890,  810,  330, 260, ["DetectorX", "DetectorZ"]),
+    ("Detector",    1890,  810,  330, 260, ["DetectorX", "DetectorY"]),
 ]
 _HOVER_COLOR  = QColor(255, 220,  80, 90)
 _BORDER_COLOR = QColor(255, 220,  80, 200)
@@ -778,63 +479,8 @@ class EndstationTab(QWidget):
         self._on_axis()
 
     def apply_config(self, key: str, value):
-        """
-        Slot wired to ConfigurationTab.config_changed(key, value).
-        Handles ui.* keys that affect the endstation tab.
-        """
-        if key == "ui.image_rate_limit_hz":
-            hz = max(0.5, float(value))
-            # _PVABridge stores the minimum inter-frame interval in ms
-            new_interval_ms = int(1000.0 / hz)
-            bridge = getattr(self._viewer, "_bridge", None)
-            if bridge is not None:
-                bridge.MIN_INTERVAL_MS = new_interval_ms
-
-        elif key == "ui.overlay_opacity_rest":
-            opacity = max(0.05, min(1.0, float(value)))
-            self._set_overlay_opacity_rest(opacity)
-
-        elif key == "ui.overlay_opacity_hover":
-            opacity = max(0.05, min(1.0, float(value)))
-            self._set_overlay_opacity_hover(opacity)
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    def _set_overlay_opacity_rest(self, opacity: float):
-        """
-        Update the at-rest opacity for every _PVOverlayWidget.
-        The overlays store their rest opacity in _opacity_rest; calling
-        _apply_opacity() re-applies it immediately if the region is not
-        currently hovered.
-        """
-        for overlay in self._overlays():
-            overlay._opacity_rest = opacity
-            # Only update immediately if the overlay is not currently hovered
-            if not getattr(overlay, "_hovered", False):
-                effect = overlay.graphicsEffect()
-                if effect is not None:
-                    effect.setOpacity(opacity)
-
-    def _set_overlay_opacity_hover(self, opacity: float):
-        """Update the hover opacity and apply it to any overlay currently hovered."""
-        for overlay in self._overlays():
-            overlay._opacity_hover = opacity
-            if getattr(overlay, "_hovered", False):
-                effect = overlay.graphicsEffect()
-                if effect is not None:
-                    effect.setOpacity(opacity)
-
-    def _overlays(self):
-        """
-        Return all _PVOverlayWidget instances.
-        Adjust the attribute name / collection to match your implementation.
-        Typical patterns:
-            return list(self._overlay_widgets.values())   # if stored in a dict
-            return self._motor_overlays                    # if stored in a list
-        """
-        # ── adapt this line to your actual overlay storage ─────────────────
-        return list(getattr(self, "_overlay_widgets", {}).values())
-
+        """Receive a config_changed signal from ConfigurationTab."""
+        pass   # extend as config-driven behaviour is added
 
     def _on_axis(self):
         xn=self._x_combo.currentText(); yn=self._y_combo.currentText()

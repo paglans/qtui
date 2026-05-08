@@ -275,7 +275,15 @@ try:
         uid8 = doc.get("uid", "unknown")[:8]
         num  = doc.get("scan_id", 0)
         dts  = _dt.fromtimestamp(doc.get("time", 0)).strftime("%Y%m%dT%H%M%S")
-        path = str(_EXPORT_DIR / f"scan_{num:04d}_{uid8}_{dts}.h5")
+        # The GUI-supplied file path arrives at the top level of the start doc
+        # (bluesky-queueserver flattens item meta into the start document).
+        # Fall back to auto-generated ~/Data path for scans run outside the GUI.
+        gui_path = doc.get("file", "")
+        if gui_path:
+            path = gui_path
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        else:
+            path = str(_EXPORT_DIR / f"scan_{num:04d}_{uid8}_{dts}.h5")
         print(f"[startup] HDF5 → {path}")
         return [_HDF5Callback(path)], []
 
