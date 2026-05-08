@@ -240,6 +240,7 @@ class ScanPlot(QWidget):
 
         self._xs: list = []; self._ys: list = []
         self._ys_accum: "np.ndarray | None" = None
+        self._xs_accum: list = []
         self._n_accum  = 0
         self._n_scans_total = 1
 
@@ -305,6 +306,7 @@ class ScanPlot(QWidget):
         import numpy as np
         self._n_scans_total = n_scans
         self._ys_accum      = None
+        self._xs_accum      = []
         self._n_accum       = 0
         if MPL_AVAILABLE:
             self._accum_line.set_data([], [])
@@ -313,19 +315,36 @@ class ScanPlot(QWidget):
                             edgecolor="#2a3a5e", labelcolor=PAL["text"])
             self._canvas.draw_idle()
 
-    def accumulate_scan(self):
-        """Add the just-completed scan's y-values to the running sum and redraw."""
-        if not self._xs or not MPL_AVAILABLE:
+    def add_point_to_accum(self, x: float, y: float):
+        """Add a single point to the running accumulator (called live per point)."""
+        import numpy as np
+        if self._n_accum == 0:
+            # First rep — build accum arrays alongside current scan
+            self._xs_accum.append(x)
+            if self._ys_accum is None:
+                self._ys_accum = np.array([y], dtype=float)
+            else:
+                self._ys_accum = np.append(self._ys_accum, y)
+            print(f"[accum] rep0 pt {len(self._xs_accum)}: x={x:.4f} y={y:.4g}")
+        else:
+            # Subsequent reps — add y to existing slot by index
+            # _xs already has this point appended, so index is len-1
+            idx = len(self._xs) - 1
+            if 0 <= idx < len(self._ys_accum):
+                self._ys_accum[idx] += y
+            print(f"[accum] rep{self._n_accum} pt {idx}: y={y:.4g}")
+
+    def finish_accum_rep(self):
+        """Called at the end of each rep to increment the rep counter."""
+        self._n_accum += 1
+
+    def redraw_accum(self):
+        """Redraw the accumulated mean line from the current accumulator state."""
+        if self._ys_accum is None or not self._xs_accum or not MPL_AVAILABLE:
             return
         import numpy as np
-        ys = np.asarray(self._ys, dtype=float)
-        if self._ys_accum is None or len(self._ys_accum) != len(ys):
-            self._ys_accum = ys.copy()
-        else:
-            self._ys_accum += ys
-        self._n_accum += 1
-        mean = self._ys_accum / self._n_accum
-        self._accum_line.set_data(self._xs, mean.tolist())
+        mean = self._ys_accum / max(self._n_accum, 1)
+        self._accum_line.set_data(self._xs_accum, mean.tolist())
         self._accum_line.set_visible(True)
         self._accum_line.set_label(
             f"Accumulated ({self._n_accum}/{self._n_scans_total})")
@@ -337,7 +356,8 @@ class ScanPlot(QWidget):
 
     def save_accumulated(self, path: str):
         """Write the accumulated (mean) spectrum to an HDF5 file."""
-        if self._ys_accum is None or not self._xs:
+        print(f"[save_accum] n_accum={self._n_accum} xs_len={len(self._xs_accum)} ys_len={len(self._ys_accum) if self._ys_accum is not None else 0}")
+        if self._ys_accum is None or not self._xs_accum:
             return
         import numpy as np
         try:
@@ -346,8 +366,8 @@ class ScanPlot(QWidget):
             mean = self._ys_accum / max(self._n_accum, 1)
             with h5py.File(p, "w") as f:
                 f.create_dataset("entry/motor_positions",
-                                 data=np.asarray(self._xs))
-                f.create_dataset("entry/accumulated_counts",
+                                 data=np.asarray(self._xs_accum))
+                f.create_dataset("entry/mean_counts",
                                  data=mean)
                 f.create_dataset("entry/sum_counts",
                                  data=self._ys_accum)
@@ -622,6 +642,8 @@ class DAQTab(QWidget):
 
         # ── Queue-server live display state ───────────────────────────────────
         self._qs_active   = False
+        self._qs_callback_connected = False
+        self._qs_scan_started       = False   # True only after first item signal
         self._qs_motor_pv = ""
         self._qs_det_pv   = ""
         self._qs_n_steps  = 0
@@ -763,8 +785,9 @@ class DAQTab(QWidget):
         self._qs_min_dt = max(exp * 0.5, 0.1)
 
         if not self._qs_active:
-            self._qs_active = True
-            self._qs_t0     = time.monotonic()
+            self._qs_active       = True
+            self._qs_scan_started = False
+            self._qs_t0           = time.monotonic()
             self._xas_plot.reset(motor_lbl, det_lbl,
                                  f"QServer: {plan_name}  (waiting…)")
             # Initialise accumulator for the full series
@@ -778,54 +801,26 @@ class DAQTab(QWidget):
                 f"color:{PAL['accent']}; font-family:monospace; font-size:8pt;")
             self._st_point.setText("0" + (f" / {n_steps}" if n_steps else ""))
             self._st_elapsed.setText("0.0 s")
-            try:
+            if self._qs_callback_connected:
                 PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
-            except RuntimeError:
-                pass
             PVMonitor().value_changed.connect(
                 self._on_qs_motor_callback, Qt.UniqueConnection)
+            self._qs_callback_connected = True
             self._qs_elapsed_timer.start()
 
     def _on_qs_running_item(self, item: dict) -> None:
         """Called when the queue server starts or finishes a scan."""
-        # ── Queue went idle — all reps done ───────────────────────────────────
+        # ── Queue went idle ───────────────────────────────────────────────────
         if not item:
-            try:
+            if self._qs_callback_connected:
                 PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
-            except RuntimeError:
-                pass
+                self._qs_callback_connected = False
             if self._qs_active:
-                self._qs_active = False
                 self._qs_elapsed_timer.stop()
-                elapsed  = time.monotonic() - self._qs_t0
-
-                # Accumulate the final rep
-                self._xas_plot.accumulate_scan()
-                self._xas_rep_idx += 1
-                rep_total = getattr(self, "_xas_rep_total", 1)
-                accum_file = getattr(self, "_xas_accum_file", "")
-
-                # Save accumulated file
-                if accum_file:
-                    self._xas_plot.save_accumulated(accum_file)
-
-                if rep_total > 1:
-                    self._log_msg(
-                        f"✔ All {rep_total} scans complete  ({elapsed:.1f} s)  "
-                        f"accum → {Path(accum_file).name}", PAL["ok"])
-                    self._xas_plot.finish(
-                        f"Complete  ({rep_total}×)  —  {Path(accum_file).name}")
-                else:
-                    self._log_msg(
-                        f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
-                    self._xas_plot.finish("QServer scan complete")
-
-                self._set_state(_ScanState.IDLE)
-                self._st_file.setText("—")
-                self._st_file.setStyleSheet(
-                    f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
-                self._qs_pending = {}
-                self._advance_counter()
+                self._qs_final_t = time.monotonic() - self._qs_t0
+                # Don't snapshot here — let 500ms settle so all PV
+                # callbacks deliver, then read _xs live in _finish_rep_and_save
+                QTimer.singleShot(500, self._finish_rep_and_save)
             return
 
         # ── New scan starting ─────────────────────────────────────────────────
@@ -835,17 +830,49 @@ class DAQTab(QWidget):
         rep_total = getattr(self, "_xas_rep_total", 1)
 
         if self._qs_active:
-            # A subsequent rep just started — accumulate the previous rep first
-            self._xas_plot.accumulate_scan()
-            self._xas_rep_idx += 1
-            rep_now = self._xas_rep_idx + 1  # 1-based for display
+            if not self._qs_scan_started:
+                # First scan start signal arrived — retroactively accumulate
+                # any points already collected since _qs_arm was called
+                self._qs_scan_started = True
+                for x, y in zip(self._xas_plot._xs, self._xas_plot._ys):
+                    self._xas_plot.add_point_to_accum(x, y)
+                self._xas_plot._line.set_data([], [])
+            else:
+                # Genuine rep boundary — split using _qs_n_steps as the
+                # authoritative point count per rep.
+                plot  = self._xas_plot
+                n_rep = self._qs_n_steps or len(plot._xs_accum) or len(plot._xs)
+
+                completed_xs = list(plot._xs[:n_rep])
+                completed_ys = list(plot._ys[:n_rep])
+                overflow_xs  = list(plot._xs[n_rep:])
+                overflow_ys  = list(plot._ys[n_rep:])
+
+                # Add any completed-rep points not yet in the accumulator
+                already = len(plot._xs_accum)
+                for x, y in zip(completed_xs[already:], completed_ys[already:]):
+                    plot.add_point_to_accum(x, y)
+
+                plot.finish_accum_rep()
+                self._xas_rep_idx += 1
+
+                # Reset display and accumulator arrays for the new rep
+                plot._xs.clear(); plot._ys.clear()
+                plot._ys_accum = None
+                plot._xs_accum = []
+                plot._n_accum  = 0
+                plot._line.set_data([], [])
+
+                # Retroactively feed overflow points into the new rep
+                for x, y in zip(overflow_xs, overflow_ys):
+                    plot.add_point(x, y)
+                    plot.add_point_to_accum(x, y)
+            rep_now = self._xas_rep_idx + 1        # 1-based for display
 
             self._log_msg(
                 f"🗂 QServer: rep {rep_now}/{rep_total}  uid=…{uid_short}",
                 PAL["accent"])
 
-            # Reset only the current-scan line; keep the accumulated line
-            self._xas_plot._xs.clear(); self._xas_plot._ys.clear()
             self._xas_plot._line.set_data([], [])
             title = (f"QServer: {plan}  rep {rep_now}/{rep_total}  (…{uid_short})"
                      if rep_total > 1 else
@@ -858,14 +885,13 @@ class DAQTab(QWidget):
             self._qs_t0     = time.monotonic()
             self._qs_last_x = None
             self._qs_elapsed_timer.start()
-            self._qs_record_now()
+            # Don't call _qs_record_now here — motor callbacks handle first point
             return
 
         # ── First scan starting (safety net / external client) ────────────────
         self._log_msg(
             f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
 
-        # Safety net: scan was queued from another client — resolve PVs from args
         inv_map = {v: k for k, v in self._device_map.items()}
 
         def _resolve(devname):
@@ -899,6 +925,43 @@ class DAQTab(QWidget):
             self._xas_plot._canvas.draw_idle()
         self._st_file.setText(f"{plan} · …{uid_short}")
 
+    def _finish_rep_and_save(self):
+        """Called 500 ms after queue goes idle; finalises accumulation and saves."""
+        self._qs_active       = False
+        self._qs_scan_started = False
+        elapsed    = getattr(self, "_qs_final_t", 0.0)
+        rep_total  = getattr(self, "_xas_rep_total", 1)
+        accum_file = getattr(self, "_xas_accum_file", "")
+
+        # Finalise the last rep's contribution to the accumulator
+        if self._xas_plot._xs:
+            self._xas_plot.finish_accum_rep()
+            self._xas_rep_idx += 1
+
+        # Redraw accumulated mean line from the now-complete accumulator
+        self._xas_plot.redraw_accum()
+
+        if accum_file:
+            self._xas_plot.save_accumulated(accum_file)
+
+        if rep_total > 1:
+            self._log_msg(
+                f"✔ All {rep_total} scans complete  ({elapsed:.1f} s)  "
+                f"accum → {Path(accum_file).name}", PAL["ok"])
+            self._xas_plot.finish(
+                f"Complete  ({rep_total}×)  —  {Path(accum_file).name}")
+        else:
+            self._log_msg(
+                f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
+            self._xas_plot.finish("QServer scan complete")
+
+        self._set_state(_ScanState.IDLE)
+        self._st_file.setText("—")
+        self._st_file.setStyleSheet(
+            f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
+        self._qs_pending = {}
+        self._advance_counter()
+
     def _on_qs_motor_callback(self, pv_name: str, value) -> None:
         """Fires on every PVMonitor value_changed while a QS scan is active."""
         if not self._qs_active:
@@ -913,12 +976,12 @@ class DAQTab(QWidget):
             return
 
         now      = time.monotonic()
-        too_soon = (now - self._qs_last_t) < self._qs_min_dt
         same_pos = (self._qs_last_x is not None
                     and abs(x - self._qs_last_x) < 1e-6)
-        if too_soon and same_pos:
-            return
-        if too_soon and self._qs_last_x is not None:
+        if same_pos:
+            return   # motor hasn't moved — ignore regardless of timing
+        too_soon = (now - self._qs_last_t) < self._qs_min_dt
+        if too_soon:
             return
         self._qs_last_x = x
         self._qs_last_t = now
@@ -930,6 +993,8 @@ class DAQTab(QWidget):
             y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
 
         self._xas_plot.add_point(x, y)
+        if self._qs_scan_started:
+            self._xas_plot.add_point_to_accum(x, y)
         n_pts = len(self._xas_plot._xs)
         n     = self._qs_n_steps
         self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
@@ -973,6 +1038,8 @@ class DAQTab(QWidget):
             y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
 
         self._xas_plot.add_point(x, y)
+        if self._qs_scan_started:
+            self._xas_plot.add_point_to_accum(x, y)
         n_pts = len(self._xas_plot._xs)
         n     = self._qs_n_steps
         self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
