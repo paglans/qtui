@@ -165,7 +165,11 @@ class ScanPlot(QWidget):
             self._fig    = Figure(facecolor=PAL["surface"], tight_layout=True)
             self._ax     = self._fig.add_subplot(111)
             self._line,  = self._ax.plot([], [], color=PAL["accent"],
-                                         lw=1.4, marker=".", ms=4)
+                                         lw=1.4, marker=".", ms=4,
+                                         label="Current scan")
+            self._accum_line, = self._ax.plot([], [], color=PAL["ok"],
+                                              lw=2.0, ls="-", alpha=0.85,
+                                              label="Accumulated", visible=False)
             # Crosshair lines — hidden until mouse enters axes
             self._ch_v = self._ax.axvline(x=0, color=PAL["text"],
                                           lw=0.8, ls="--", alpha=0.6, visible=False)
@@ -235,6 +239,9 @@ class ScanPlot(QWidget):
         vl.addLayout(readout_row)
 
         self._xs: list = []; self._ys: list = []
+        self._ys_accum: "np.ndarray | None" = None
+        self._n_accum  = 0
+        self._n_scans_total = 1
 
     def _style_ax(self):
         ax = self._ax; ax.set_facecolor(PAL["bg"])
@@ -259,14 +266,13 @@ class ScanPlot(QWidget):
         self._canvas.draw_idle()
         self._ro_pos.setText("—"); self._ro_int.setText("—")
 
-    def _fit_to_data(self):
+    def _fit_to_data(self, extra_ys=None):
         """Set axis limits to the full data range with padding."""
         if not self._xs or not MPL_AVAILABLE:
             return
+        all_ys = list(self._ys) + (extra_ys or [])
         xmin, xmax = min(self._xs), max(self._xs)
-        ymin, ymax = min(self._ys), max(self._ys)
-        # Use 2% / 5% of the data range as padding; for near-constant axes
-        # fall back to 1% of the absolute value so tiny signals still get room
+        ymin, ymax = min(all_ys),   max(all_ys)
         xspan = xmax - xmin
         yspan = ymax - ymin
         xpad = xspan * 0.02 if xspan else abs(xmax) * 0.01 or 0.5
@@ -293,6 +299,61 @@ class ScanPlot(QWidget):
         self._ax.set_title(title or "Scan complete",
                            color=PAL["ok"], fontsize=9)
         self._canvas.draw_idle()
+
+    def start_accumulation(self, n_scans: int):
+        """Call before the first repetition to initialise the accumulator."""
+        import numpy as np
+        self._n_scans_total = n_scans
+        self._ys_accum      = None
+        self._n_accum       = 0
+        if MPL_AVAILABLE:
+            self._accum_line.set_data([], [])
+            self._accum_line.set_visible(n_scans > 1)
+            self._ax.legend(fontsize=7, facecolor=PAL["surface"],
+                            edgecolor="#2a3a5e", labelcolor=PAL["text"])
+            self._canvas.draw_idle()
+
+    def accumulate_scan(self):
+        """Add the just-completed scan's y-values to the running sum and redraw."""
+        if not self._xs or not MPL_AVAILABLE:
+            return
+        import numpy as np
+        ys = np.asarray(self._ys, dtype=float)
+        if self._ys_accum is None or len(self._ys_accum) != len(ys):
+            self._ys_accum = ys.copy()
+        else:
+            self._ys_accum += ys
+        self._n_accum += 1
+        mean = self._ys_accum / self._n_accum
+        self._accum_line.set_data(self._xs, mean.tolist())
+        self._accum_line.set_visible(True)
+        self._accum_line.set_label(
+            f"Accumulated ({self._n_accum}/{self._n_scans_total})")
+        self._ax.legend(fontsize=7, facecolor=PAL["surface"],
+                        edgecolor="#2a3a5e", labelcolor=PAL["text"])
+        if getattr(self, "_auto_scale", True):
+            self._fit_to_data(extra_ys=mean.tolist())
+        self._canvas.draw_idle()
+
+    def save_accumulated(self, path: str):
+        """Write the accumulated (mean) spectrum to an HDF5 file."""
+        if self._ys_accum is None or not self._xs:
+            return
+        import numpy as np
+        try:
+            import h5py
+            p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+            mean = self._ys_accum / max(self._n_accum, 1)
+            with h5py.File(p, "w") as f:
+                f.create_dataset("entry/motor_positions",
+                                 data=np.asarray(self._xs))
+                f.create_dataset("entry/accumulated_counts",
+                                 data=mean)
+                f.create_dataset("entry/sum_counts",
+                                 data=self._ys_accum)
+                f["entry"].attrs["n_accumulated"] = self._n_accum
+        except Exception as e:
+            print(f"[ScanPlot] save_accumulated error: {e}")
 
     # ── Cursor ────────────────────────────────────────────────────────────────
     def _on_mouse_move(self, ev):
@@ -573,6 +634,15 @@ class DAQTab(QWidget):
         # ── RIXS excitation energies (From XAS list) ──────────────────────────
         self._rixs_energies: list[float] = []
 
+        # ── Multiple-scan accumulation state ──────────────────────────────────
+        self._xas_rep_total   = 1    # total repetitions requested
+        self._xas_rep_idx     = 0    # current repetition (0-based)
+        self._xas_rep_files: list[str] = []   # per-rep filenames submitted
+
+        # ── Scan counter persistence ──────────────────────────────────────────
+        self._counter_path = Path.home() / ".config" / "amber_qtui" / "scan_counter.json"
+        self._counter_path.parent.mkdir(parents=True, exist_ok=True)
+
         outer = QVBoxLayout(self); outer.setContentsMargins(0,0,0,0); outer.setSpacing(0)
         hdr = QLabel("  💾  Data Acquisition")
         hdr.setFont(QFont("Sans Serif",9,QFont.Bold))
@@ -659,6 +729,8 @@ class DAQTab(QWidget):
 
         hsplit.setSizes([380, 900, 240])
         outer.addWidget(hsplit, 1)
+        # Initialise filename display after all widgets exist
+        QTimer.singleShot(0, self._update_filename_display)
 
     # ── Queue tab wiring ──────────────────────────────────────────────────────
     def set_queue_tab(self, qt) -> None:
@@ -695,6 +767,9 @@ class DAQTab(QWidget):
             self._qs_t0     = time.monotonic()
             self._xas_plot.reset(motor_lbl, det_lbl,
                                  f"QServer: {plan_name}  (waiting…)")
+            # Initialise accumulator for the full series
+            self._xas_plot.start_accumulation(
+                getattr(self, "_xas_rep_total", 1))
             self._progress.setMaximum(n_steps if n_steps else 0)
             self._progress.setValue(0)
             self._set_state(_ScanState.RUNNING)
@@ -713,7 +788,7 @@ class DAQTab(QWidget):
 
     def _on_qs_running_item(self, item: dict) -> None:
         """Called when the queue server starts or finishes a scan."""
-        # ── Scan ended ────────────────────────────────────────────────────────
+        # ── Queue went idle — all reps done ───────────────────────────────────
         if not item:
             try:
                 PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
@@ -722,35 +797,73 @@ class DAQTab(QWidget):
             if self._qs_active:
                 self._qs_active = False
                 self._qs_elapsed_timer.stop()
-                elapsed = time.monotonic() - self._qs_t0
-                self._xas_plot.finish("QServer scan complete")
-                self._log_msg(
-                    f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
+                elapsed  = time.monotonic() - self._qs_t0
+
+                # Accumulate the final rep
+                self._xas_plot.accumulate_scan()
+                self._xas_rep_idx += 1
+                rep_total = getattr(self, "_xas_rep_total", 1)
+                accum_file = getattr(self, "_xas_accum_file", "")
+
+                # Save accumulated file
+                if accum_file:
+                    self._xas_plot.save_accumulated(accum_file)
+
+                if rep_total > 1:
+                    self._log_msg(
+                        f"✔ All {rep_total} scans complete  ({elapsed:.1f} s)  "
+                        f"accum → {Path(accum_file).name}", PAL["ok"])
+                    self._xas_plot.finish(
+                        f"Complete  ({rep_total}×)  —  {Path(accum_file).name}")
+                else:
+                    self._log_msg(
+                        f"✔ QServer scan finished  ({elapsed:.1f} s)", PAL["ok"])
+                    self._xas_plot.finish("QServer scan complete")
+
                 self._set_state(_ScanState.IDLE)
                 self._st_file.setText("—")
                 self._st_file.setStyleSheet(
                     f"color:{PAL['subtext']}; font-family:monospace; font-size:8pt;")
                 self._qs_pending = {}
+                self._advance_counter()
             return
 
-        # ── Scan running ──────────────────────────────────────────────────────
+        # ── New scan starting ─────────────────────────────────────────────────
         plan      = item.get("name", "?")
         args      = item.get("args", [])
         uid_short = item.get("item_uid", "")[:8]
-
-        self._log_msg(
-            f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
+        rep_total = getattr(self, "_xas_rep_total", 1)
 
         if self._qs_active:
-            self._xas_plot._ax.set_title(
-                f"QServer: {plan}  (…{uid_short})",
-                color=PAL["text"], fontsize=9)
+            # A subsequent rep just started — accumulate the previous rep first
+            self._xas_plot.accumulate_scan()
+            self._xas_rep_idx += 1
+            rep_now = self._xas_rep_idx + 1  # 1-based for display
+
+            self._log_msg(
+                f"🗂 QServer: rep {rep_now}/{rep_total}  uid=…{uid_short}",
+                PAL["accent"])
+
+            # Reset only the current-scan line; keep the accumulated line
+            self._xas_plot._xs.clear(); self._xas_plot._ys.clear()
+            self._xas_plot._line.set_data([], [])
+            title = (f"QServer: {plan}  rep {rep_now}/{rep_total}  (…{uid_short})"
+                     if rep_total > 1 else
+                     f"QServer: {plan}  (…{uid_short})")
+            self._xas_plot._ax.set_title(title, color=PAL["text"], fontsize=9)
             if hasattr(self._xas_plot, "_canvas"):
                 self._xas_plot._canvas.draw_idle()
-            self._st_file.setText(f"{plan} · …{uid_short}")
+            self._st_file.setText(f"{plan} · rep {rep_now}/{rep_total}")
+            self._qs_active = True
+            self._qs_t0     = time.monotonic()
             self._qs_last_x = None
+            self._qs_elapsed_timer.start()
             self._qs_record_now()
             return
+
+        # ── First scan starting (safety net / external client) ────────────────
+        self._log_msg(
+            f"🗂 QServer running: plan={plan!r}  uid=…{uid_short}", PAL["accent"])
 
         # Safety net: scan was queued from another client — resolve PVs from args
         inv_map = {v: k for k, v in self._device_map.items()}
@@ -871,6 +984,8 @@ class DAQTab(QWidget):
         """Receive a config_changed signal from ConfigurationTab."""
         if key == "data_acquisition.default_output_dir" and value:
             self._dir_edit.setText(str(Path(str(value)).expanduser()))
+        if key == "data_acquisition.filename_mode":
+            self._update_filename_display()
 
     # ── Config helpers ────────────────────────────────────────────────────────
     @staticmethod
@@ -908,25 +1023,40 @@ class DAQTab(QWidget):
 
         gl.addWidget(ql("File prefix"), 1, 0)
         self._prefix_edit = QLineEdit("scan")
-        self._prefix_edit.setStyleSheet(INPUT_STYLE); gl.addWidget(self._prefix_edit, 1, 1, 1, 2)
+        self._prefix_edit.setStyleSheet(INPUT_STYLE)
+        gl.addWidget(self._prefix_edit, 1, 1, 1, 2)
 
-        gl.addWidget(ql("Scan number"), 2, 0)
-        self._scan_num = QSpinBox(); self._scan_num.setRange(1, 99999)
-        self._scan_num.setValue(1); self._scan_num.setStyleSheet(SPIN_STYLE)
-        gl.addWidget(self._scan_num, 2, 1, 1, 2)
-
-        gl.addWidget(ql("Format"), 3, 0)
+        gl.addWidget(ql("Format"), 2, 0)
         self._fmt_combo = QComboBox(); self._fmt_combo.setStyleSheet(COMBO_STYLE)
-        for fmt in ("HDF5 (.h5)", "CSV (.csv)", "SPEC (.dat)"): self._fmt_combo.addItem(fmt)
-        gl.addWidget(self._fmt_combo, 3, 1, 1, 2)
+        for fmt in ("HDF5 (.h5)", "CSV (.csv)", "SPEC (.dat)"):
+            self._fmt_combo.addItem(fmt)
+        gl.addWidget(self._fmt_combo, 2, 1, 1, 2)
 
-        self._auto_inc = QCheckBox("Auto-increment scan number")
-        self._auto_inc.setStyleSheet(CHECK_STYLE); self._auto_inc.setChecked(True)
-        gl.addWidget(self._auto_inc, 4, 0, 1, 3)
+        gl.addWidget(ql("File name"), 3, 0)
+        self._filename_display = QLineEdit()
+        self._filename_display.setReadOnly(True)
+        self._filename_display.setStyleSheet(
+            INPUT_STYLE + "color: " + PAL["subtext"] + ";")
+        self._filename_display.setPlaceholderText("—")
+        gl.addWidget(self._filename_display, 3, 1, 1, 2)
 
         self._dated_folders = QCheckBox("Dated folders  (YYYYMMDD/)")
-        self._dated_folders.setStyleSheet(CHECK_STYLE); self._dated_folders.setChecked(False)
-        gl.addWidget(self._dated_folders, 5, 0, 1, 3)
+        self._dated_folders.setStyleSheet(CHECK_STYLE)
+        self._dated_folders.setChecked(False)
+        gl.addWidget(self._dated_folders, 4, 0, 1, 3)
+
+        # Wire live filename preview
+        self._prefix_edit.textChanged.connect(self._update_filename_display)
+        self._fmt_combo.currentIndexChanged.connect(self._update_filename_display)
+        self._dated_folders.stateChanged.connect(self._update_filename_display)
+        self._dir_edit.textChanged.connect(self._update_filename_display)
+
+        # Dummy _scan_num and _auto_inc kept for compatibility with scan engine
+        self._scan_num = QSpinBox(); self._scan_num.setRange(1, 99999)
+        self._scan_num.setValue(self._load_counter()); self._scan_num.setVisible(False)
+        self._auto_inc = QCheckBox(); self._auto_inc.setChecked(True)
+        self._auto_inc.setVisible(False)
+
         return grp
 
     def _build_scan_group(self):
@@ -1039,22 +1169,94 @@ class DAQTab(QWidget):
         else:
             self._log.append(f'<span style="color:{PAL["subtext"]}">[{ts}]</span> {text}')
 
-    def _current_filename(self):
+    # ── Scan counter persistence ──────────────────────────────────────────────
+    def _load_counter(self) -> int:
+        """Read the next scan number for the current prefix from disk."""
+        try:
+            import json as _json
+            data = _json.loads(self._counter_path.read_text())
+            prefix = self._prefix_edit.text().strip() if hasattr(self, "_prefix_edit") else "scan"
+            return int(data.get(prefix, 1))
+        except Exception:
+            return 1
+
+    def _save_counter(self, num: int):
+        """Persist the next scan number for the current prefix."""
+        try:
+            import json as _json
+            data: dict = {}
+            try:
+                data = _json.loads(self._counter_path.read_text())
+            except Exception:
+                pass
+            prefix = self._prefix_edit.text().strip() or "scan"
+            data[prefix] = num
+            self._counter_path.write_text(_json.dumps(data, indent=2))
+        except Exception as e:
+            self._log_msg(f"[warn] Could not save scan counter: {e}", PAL.get("warn", "#ffaa00"))
+
+    def _filename_mode(self) -> str:
+        """Return 'number' or 'timestamp' from config; default 'timestamp'."""
+        if self._config_tab is not None:
+            mode = self._config_tab.get("data_acquisition.filename_mode")
+            if mode in ("number", "timestamp"):
+                return mode
+        return "timestamp"
+
+    def _update_filename_display(self, *_):
+        """Refresh the read-only File name field to show the next filename stem."""
+        if not hasattr(self, "_filename_display"):
+            return
+        fname = self._next_filename(peek=True)
+        self._filename_display.setText(Path(fname).name)
+
+    def _next_filename(self, peek: bool = False) -> str:
+        """Return the full path for the next file.
+
+        In 'number' mode, reads the counter from disk.  When *peek* is False
+        the counter is NOT incremented (call _save_counter after a scan
+        completes to advance it).
+        """
         base   = Path(self._dir_edit.text().strip() or ".")
         if self._dated_folders.isChecked():
             dated = base / datetime.now().strftime("%Y%m%d")
             try:
                 dated.mkdir(parents=True, exist_ok=True)
             except OSError as e:
-                self._log_msg(f"[warn] Could not create dated folder: {e}", PAL.get("warn", "#ffaa00"))
+                self._log_msg(f"[warn] Could not create dated folder: {e}",
+                              PAL.get("warn", "#ffaa00"))
                 dated = base
-            d = str(dated)
+            d = dated
         else:
-            d = str(base)
+            d = base
         prefix = self._prefix_edit.text().strip() or "scan"
-        num    = self._scan_num.value()
-        ext    = {0:".h5", 1:".csv", 2:".dat"}.get(self._fmt_combo.currentIndex(), ".dat")
-        return f"{d}/{prefix}_{num:04d}{ext}"
+        ext    = {0: ".h5", 1: ".csv", 2: ".dat"}.get(
+            self._fmt_combo.currentIndex(), ".h5")
+        mode = self._filename_mode()
+        if mode == "number":
+            num  = self._load_counter()
+            stem = f"{prefix}_{num:04d}"
+        else:
+            stem = datetime.now().strftime("%Y%m%dT%H%M%S")
+        return str(d / f"{stem}{ext}")
+
+    def _current_filename(self) -> str:
+        """Return the filename for the current scan and advance the counter."""
+        path = self._next_filename(peek=False)
+        # Update hidden spinbox for legacy compatibility
+        if self._filename_mode() == "number":
+            num = self._load_counter()
+            self._scan_num.setValue(num)
+        self._update_filename_display()
+        return path
+
+    def _advance_counter(self):
+        """Increment and persist the scan counter (number mode only)."""
+        if self._filename_mode() == "number":
+            num = self._load_counter() + 1
+            self._scan_num.setValue(num)
+            self._save_counter(num)
+            self._update_filename_display()
 
     def _set_state(self, state: str):
         self._state = state
@@ -1149,8 +1351,7 @@ class DAQTab(QWidget):
         fname = self._current_filename()
         self._xas_plot.finish(f"Scan complete — {Path(fname).name}")
         self._log_msg(f"✔ Scan complete.  File: {fname}", PAL["ok"])
-        if self._auto_inc.isChecked():
-            self._scan_num.setValue(self._scan_num.value() + 1)
+        self._advance_counter()
         self._set_state(_ScanState.IDLE)
         self._reset_run_btns()
 
@@ -1209,22 +1410,65 @@ class DAQTab(QWidget):
             self._log_msg("[warn] No XAS scan selected", PAL["nc"]); return
         defn = self._xas_scan_defs[idx]
         from scan_types import XASScan
-        scan = XASScan(defn)
+        scan          = XASScan(defn)
         det_friendly  = self._det_combo.currentText()
         det_ophyd     = device_name(det_friendly)
         motor_ophyd   = device_name(defn.motor)
         plan_name, args, kwargs = scan.to_plan(
             motor_ophyd, det_ophyd,
             exposure_time=getattr(defn, "exposure_time", 1.0))
-        meta = {"scan_name": defn.name, "scan_type": "XAS",
-                "n_points": defn.n_points(), "file": self._current_filename()}
-        ok = qt.add_plan(plan_name, args, kwargs, meta)
-        if ok:
-            self._log_msg(f"✔ XAS '{defn.name}' added to queue  ({defn.n_points()} pts)", PAL["ok"])
-            motor_pv = self._motor_pvs.get(defn.motor, "")
-            det_pv   = ({**self._signal_pvs, **self._det_pvs}).get(det_friendly, "")
-            self._qs_arm(motor_pv, det_pv, defn.motor, det_friendly,
-                         defn.n_points(), plan_name)
+
+        n_scans   = self._xas_n_scans.value()
+        base_file = self._current_filename()   # e.g. ~/Data/20260506/scan_0001.h5
+        base_path = Path(base_file)
+        stem      = base_path.stem             # e.g. scan_0001
+        suffix    = base_path.suffix           # e.g. .h5
+        parent    = base_path.parent
+
+        # Accumulated file — same name as base (no rep suffix)
+        accum_file = str(base_path)
+
+        rep_files = []
+        for rep in range(1, n_scans + 1):
+            if n_scans > 1:
+                rep_file = str(parent / f"{stem}_rep{rep:02d}{suffix}")
+            else:
+                rep_file = accum_file
+            rep_files.append(rep_file)
+            meta = {
+                "scan_name"     : defn.name,
+                "scan_type"     : "XAS",
+                "n_points"      : defn.n_points(),
+                "repetition"    : rep,
+                "n_repetitions" : n_scans,
+                "file"          : rep_file,
+                "accumulate_file": accum_file,
+            }
+            ok = qt.add_plan(plan_name, args, kwargs, meta)
+            if not ok:
+                self._log_msg(
+                    f"✘ Failed to add rep {rep}/{n_scans} to queue", PAL["nc"])
+                return
+
+        self._xas_rep_total = n_scans
+        self._xas_rep_idx   = 0
+        self._xas_rep_files = rep_files
+        self._xas_accum_file = accum_file
+
+        if n_scans > 1:
+            self._log_msg(
+                f"✔ XAS '{defn.name}'  ×{n_scans} added to queue  "
+                f"({defn.n_points()} pts/scan)  accum → {Path(accum_file).name}",
+                PAL["ok"])
+        else:
+            self._log_msg(
+                f"✔ XAS '{defn.name}' added to queue  ({defn.n_points()} pts)",
+                PAL["ok"])
+
+        motor_pv = self._motor_pvs.get(defn.motor, "")
+        det_pv   = ({**self._signal_pvs, **self._det_pvs}).get(det_friendly, "")
+        self._qs_arm(motor_pv, det_pv, defn.motor, det_friendly,
+                     defn.n_points(), plan_name)
 
     def _on_rixs_queue(self):
         # Placeholder — RIXS plan submission will be implemented with RIXSScanPlot
@@ -1394,6 +1638,15 @@ class DAQTab(QWidget):
 
         sep = QFrame(); sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet("color:#2a3a5e;"); vl.addWidget(sep)
+
+        # Multiple scans spinbox
+        rep_row = QHBoxLayout(); rep_row.setSpacing(6)
+        rep_row.addWidget(ql("Multiple scans"))
+        self._xas_n_scans = QSpinBox()
+        self._xas_n_scans.setRange(1, 999); self._xas_n_scans.setValue(1)
+        self._xas_n_scans.setStyleSheet(SPIN_STYLE); self._xas_n_scans.setFixedWidth(70)
+        rep_row.addWidget(self._xas_n_scans); rep_row.addStretch()
+        vl.addLayout(rep_row)
 
         # Queue / Pause / Abort
         btn_row = QHBoxLayout(); btn_row.setSpacing(4)
