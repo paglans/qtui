@@ -228,12 +228,13 @@ class ScanPlot(QWidget):
         vl.addLayout(readout_row)
 
         # Accumulator state
-        self._xs: list  = []          # mirror of _xs_accum for cursor snap
-        self._ys: list  = []          # mirror of mean for cursor snap
-        self._xs_accum: list = []
-        self._ys_accum  = None        # numpy array, sum across reps
-        self._xs_accum_ptr: int = 0   # write index for rep N>0
-        self._n_accum: int = 0        # completed reps
+        self._xs: list  = []          # mirror for cursor snap
+        self._ys: list  = []
+        self._xs_accum: list = []     # canonical x positions (set on first rep)
+        self._xs_build: list = []     # current rep y positions being built
+        self._ys_build: list = []     # current rep y values being built
+        self._ys_sum          = None  # numpy array: sum of completed reps
+        self._n_accum: int    = 0     # number of completed reps
         self._n_scans_total: int = 1
 
     # ── Axis styling ──────────────────────────────────────────────────────────
@@ -250,8 +251,8 @@ class ScanPlot(QWidget):
     def reset(self, motor_lbl="Motor position", signal_lbl="Counts", title=""):
         """Start a new scan: clear all data and reset accumulators."""
         self._xs.clear(); self._ys.clear()
-        self._xs_accum = []; self._ys_accum = None
-        self._xs_accum_ptr = 0; self._n_accum = 0
+        self._xs_accum = []; self._xs_build = []; self._ys_build = []
+        self._ys_sum = None; self._n_accum = 0
         if not MPL_AVAILABLE: return
         self._accum_line.set_data([], [])
         self._ax.set_xlabel(motor_lbl,  color=PAL["subtext"], fontsize=8)
@@ -269,49 +270,68 @@ class ScanPlot(QWidget):
         self._n_scans_total = n_scans
         # Data cleared in reset(); just store the target count
 
-    def add_point_to_accum(self, x: float, y: float):
-        """Add one (x, y) point to the accumulator and redraw the mean line."""
+    def add_point_to_accum(self, x: float, y: float, n_rep: int = 0):
+        """Append point to current rep build buffer and update display."""
         import numpy as np
-        if self._n_accum == 0:
-            # Rep 0: build arrays
-            self._xs_accum.append(x)
-            if self._ys_accum is None:
-                self._ys_accum = np.array([y], dtype=float)
-            else:
-                self._ys_accum = np.append(self._ys_accum, y)
-        else:
-            # Rep N>0: accumulate into existing slot via write pointer
-            idx = self._xs_accum_ptr
-            if 0 <= idx < len(self._ys_accum):
-                self._ys_accum[idx] += y
-                self._xs_accum_ptr += 1
-                print(f"[accum] n={self._n_accum} ptr={self._xs_accum_ptr-1}→{self._xs_accum_ptr} x={x:.3f}")
-            else:
-                print(f"[accum] DROPPED n={self._n_accum} ptr={idx} len={len(self._ys_accum)} x={x:.3f}")
-                return   # out of bounds — ignore
+
+        # Auto-finalise if build buffer is full (rep boundary detected by count)
+        if n_rep > 0 and len(self._xs_build) >= n_rep:
+            self.finish_accum_rep()
+            # Don't call redraw_accum here — the append below will redraw
+
+        self._xs_build.append(x)
+        self._ys_build.append(y)
         if not MPL_AVAILABLE:
             return
-        # Always show mean = sum / max(n_accum, 1)  (rep 0: mean == raw data)
-        mean = self._ys_accum / max(self._n_accum, 1)
-        self._accum_line.set_data(self._xs_accum, mean.tolist())
-        # Mirror into _xs/_ys for cursor snap
-        self._xs = list(self._xs_accum)
-        self._ys = mean.tolist()
-        if getattr(self, "_auto_scale", True) and len(self._xs_accum) >= 2:
+        n_built = len(self._xs_build)
+
+        if self._ys_sum is not None:
+            # Show completed mean for all positions, blended with current build
+            # for positions already measured in this rep
+            mean_full = self._ys_sum / max(self._n_accum, 1)  # completed mean
+            display = mean_full.copy()
+            n_show = min(n_built, len(display))
+            # Update positions already measured in this rep with running mean
+            display[:n_show] = (
+                self._ys_sum[:n_show] + np.asarray(self._ys_build[:n_show])
+            ) / (self._n_accum + 1)
+            xs_show = self._xs_accum
+        else:
+            # First rep — just show what we have so far
+            display = np.asarray(self._ys_build)
+            xs_show = self._xs_build
+
+        self._accum_line.set_data(xs_show, display.tolist())
+        self._xs = list(xs_show)
+        self._ys = display.tolist()
+        if getattr(self, "_auto_scale", True) and len(xs_show) >= 2:
             self._fit_to_data()
         self._canvas.draw_idle()
 
     def finish_accum_rep(self):
-        """Finalise a completed rep and reset write pointer for the next."""
+        """Add current build buffer to the running sum and reset for next rep."""
+        import numpy as np
+        if not self._ys_build:
+            return
+        ys = np.asarray(self._ys_build)
+        if self._ys_sum is None:
+            self._ys_sum   = ys.copy()
+            self._xs_accum = list(self._xs_build)
+        else:
+            n = min(len(self._ys_sum), len(ys))
+            self._ys_sum   = self._ys_sum[:n] + ys[:n]
+            self._xs_accum = self._xs_accum[:n]
         self._n_accum += 1
-        self._xs_accum_ptr = 0
+        # Clear build buffer for next rep
+        self._xs_build = []
+        self._ys_build = []
 
     def redraw_accum(self):
-        """Full redraw of the mean line — called after final rep completes."""
-        if self._ys_accum is None or not self._xs_accum or not MPL_AVAILABLE:
+        """Redraw the mean line from the completed sum."""
+        if self._ys_sum is None or not self._xs_accum or not MPL_AVAILABLE:
             return
         import numpy as np
-        mean = self._ys_accum / max(self._n_accum, 1)
+        mean = self._ys_sum / max(self._n_accum, 1)
         self._accum_line.set_data(self._xs_accum, mean.tolist())
         self._xs = list(self._xs_accum)
         self._ys = mean.tolist()
@@ -327,7 +347,7 @@ class ScanPlot(QWidget):
 
     def save_accumulated(self, path: str):
         """Write the accumulated mean spectrum to HDF5."""
-        if self._ys_accum is None or not self._xs_accum:
+        if self._ys_sum is None or not self._xs_accum:
             return
         import numpy as np
         try:
@@ -338,21 +358,25 @@ class ScanPlot(QWidget):
                 f.create_dataset("entry/motor_positions",
                                  data=np.asarray(self._xs_accum))
                 f.create_dataset("entry/mean_counts",
-                                 data=self._ys_accum / n)
+                                 data=self._ys_sum / n)
                 f.create_dataset("entry/sum_counts",
-                                 data=self._ys_accum)
+                                 data=self._ys_sum)
                 f["entry"].attrs["n_accumulated"] = self._n_accum
         except Exception as e:
             print(f"[ScanPlot] save_accumulated error: {e}")
 
     # ── Axis scaling ──────────────────────────────────────────────────────────
     def _fit_to_data(self, extra_ys=None):
-        if not MPL_AVAILABLE or not self._xs_accum or self._ys_accum is None:
+        if not MPL_AVAILABLE:
             return
         import numpy as np
-        mean = self._ys_accum / max(self._n_accum, 1)
-        xs = self._xs_accum
-        ys = mean.tolist() + (extra_ys or [])
+        # Scale from the currently visible data
+        xd, yd = self._accum_line.get_data()
+        if not len(xd):
+            return
+        xs, ys = list(xd), list(yd)
+        if not xs or not ys:
+            return
         xmin, xmax = min(xs), max(xs)
         ymin, ymax = min(ys), max(ys)
         xspan = xmax - xmin; yspan = ymax - ymin
@@ -780,7 +804,7 @@ class DAQTab(QWidget):
 
         if not self._qs_active:
             self._qs_active       = True
-            self._qs_scan_started = True
+            self._qs_scan_started = False   # wait for item signal before accumulating
             self._qs_raw_xs: list = []
             self._qs_wait_total   = 0.0
             self._qs_t0           = time.monotonic()
@@ -824,22 +848,8 @@ class DAQTab(QWidget):
         rep_total = getattr(self, "_xas_rep_total", 1)
 
         if self._qs_active:
-            plot  = self._xas_plot
-            n_rep = self._qs_n_steps or 0
-            is_boundary = (n_rep > 0 and len(plot._xs_accum) >= n_rep)
-
-            if is_boundary:
-                # Genuine rep boundary — trim to exactly n_rep pts and finalise
-                if len(plot._xs_accum) > n_rep:
-                    import numpy as np
-                    plot._xs_accum = plot._xs_accum[:n_rep]
-                    plot._ys_accum = plot._ys_accum[:n_rep]
-                plot.finish_accum_rep()
-                self._xas_rep_idx += 1
-                plot.redraw_accum()
-                plot._xs_accum_ptr = 0
-                self._qs_raw_xs = []
-
+            self._qs_scan_started = True
+            rep_now = self._xas_plot._n_accum + 1
             rep_now = self._xas_rep_idx + 1
             self._log_msg(
                 f"🗂 QServer: rep {rep_now}/{rep_total}  uid=…{uid_short}",
@@ -902,22 +912,14 @@ class DAQTab(QWidget):
         # For rep N>0, _xs_accum_ptr tracks how many points were written this rep.
         # For rep 0 (n_accum==0), len(_xs_accum) is the point count.
         if n_rep > 0:
-            if plot._n_accum == 0:
-                pts_this_rep = len(plot._xs_accum)
-            else:
-                pts_this_rep = plot._xs_accum_ptr
-
-            elapsed_wait = time.monotonic() - getattr(self, "_qs_final_t", 0.0)
+            pts_this_rep = len(plot._xs_build)
             wait_total   = getattr(self, "_qs_wait_total", 0.0)
-
             if pts_this_rep < n_rep and wait_total < 5.0:
-                # Not all points arrived yet — retry in 200ms
                 self._qs_wait_total = wait_total + 0.2
                 QTimer.singleShot(200, self._finish_rep_and_save)
                 return
 
         # All points received (or timeout) — disconnect and finalise
-        print(f"[finish] proceeding: n_accum={plot._n_accum} ptr={plot._xs_accum_ptr} n_rep={n_rep}")
         if self._qs_callback_connected:
             PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
             self._qs_callback_connected = False
@@ -927,13 +929,6 @@ class DAQTab(QWidget):
         elapsed    = time.monotonic() - getattr(self, "_qs_t0", time.monotonic())
         rep_total  = getattr(self, "_xas_rep_total", 1)
         accum_file = getattr(self, "_xas_accum_file", "")
-
-        # Trim to exactly n_rep points
-        if n_rep and plot._ys_accum is not None:
-            import numpy as np
-            if len(plot._xs_accum) > n_rep:
-                plot._xs_accum = plot._xs_accum[:n_rep]
-                plot._ys_accum = plot._ys_accum[:n_rep]
 
         # Finalise the last rep
         plot.finish_accum_rep()
@@ -992,10 +987,10 @@ class DAQTab(QWidget):
         else:
             y = sim_scalar([{"_x": x}], len(self._xas_plot._xs_accum))
 
-        self._xas_plot.add_point_to_accum(x, y)
+        self._xas_plot.add_point_to_accum(x, y, n_rep=self._qs_n_steps)
         if hasattr(self, "_qs_raw_xs"):
             self._qs_raw_xs.append(x)
-        n_pts = len(self._xas_plot._xs_accum)
+        n_pts = len(self._xas_plot._xs_build)
         n     = self._qs_n_steps
         self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
         if n:
@@ -1037,7 +1032,7 @@ class DAQTab(QWidget):
         else:
             y = sim_scalar([{"_x": x}], len(self._xas_plot._xs_accum))
 
-        self._xas_plot.add_point_to_accum(x, y)
+        self._xas_plot.add_point_to_accum(x, y, n_rep=self._qs_n_steps)
         if hasattr(self, "_qs_raw_xs"):
             self._qs_raw_xs.append(x)
         n_pts = len(self._xas_plot._xs_accum)
