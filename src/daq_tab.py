@@ -152,11 +152,7 @@ class DetectorTable(QTableWidget):
 
 # ── Scan plot ─────────────────────────────────────────────────────────────────
 class ScanPlot(QWidget):
-    """Live scan plot — shows the most recent 1-D scan as it executes.
-
-    Features a crosshair cursor that snaps to the nearest data point and
-    displays live Position / Intensity readouts below the canvas.
-    """
+    """Live scan plot — always displays the accumulated mean spectrum."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -164,18 +160,15 @@ class ScanPlot(QWidget):
         if MPL_AVAILABLE:
             self._fig    = Figure(facecolor=PAL["surface"], tight_layout=True)
             self._ax     = self._fig.add_subplot(111)
-            self._line,  = self._ax.plot([], [], color=PAL["accent"],
-                                         lw=1.4, marker=".", ms=4,
-                                         label="Current scan")
-            self._accum_line, = self._ax.plot([], [], color=PAL["ok"],
-                                              lw=2.0, ls="-", alpha=0.85,
-                                              label="Accumulated", visible=False)
-            # Crosshair lines — hidden until mouse enters axes
+            # _line kept hidden — used only for cursor snap data storage
+            self._line,  = self._ax.plot([], [], visible=False)
+            # _accum_line is the only visible trace
+            self._accum_line, = self._ax.plot([], [], color=PAL["accent"],
+                                              lw=1.8, marker=".", ms=4)
             self._ch_v = self._ax.axvline(x=0, color=PAL["text"],
                                           lw=0.8, ls="--", alpha=0.6, visible=False)
             self._ch_h = self._ax.axhline(y=0, color=PAL["text"],
                                           lw=0.8, ls="--", alpha=0.6, visible=False)
-            # Snap marker — highlights the nearest data point
             self._snap_pt, = self._ax.plot([], [], "o",
                                            color=PAL["ok"], ms=6,
                                            zorder=5, visible=False)
@@ -188,10 +181,10 @@ class ScanPlot(QWidget):
             self._toolbar = NavToolbar(self._canvas, self)
             self._toolbar.setStyleSheet(f"""
                 QToolBar {{
-                    background:{PAL['surface']}; border:none; spacing:2px;
+                    background:{PAL["surface"]}; border:none; spacing:2px;
                 }}
                 QToolButton {{
-                    background:{PAL['surface']}; color:{PAL['text']};
+                    background:{PAL["surface"]}; color:{PAL["text"]};
                     border:1px solid transparent; border-radius:3px;
                     padding:3px; font-size:8pt;
                 }}
@@ -199,11 +192,10 @@ class ScanPlot(QWidget):
                     background:#1e3a5e; border-color:#2a5a8e;
                 }}
                 QToolButton:checked {{
-                    background:{PAL['accent']}; color:{PAL['bg']};
-                    border-color:{PAL['accent']};
+                    background:{PAL["accent"]}; color:{PAL["bg"]};
+                    border-color:{PAL["accent"]};
                 }}
             """)
-            # Disable auto-scaling when the user pans/zooms; re-enable on Home
             self._auto_scale = True
             self._canvas.mpl_connect("button_release_event", self._on_btn_release)
             _orig_home = self._toolbar.home
@@ -219,10 +211,8 @@ class ScanPlot(QWidget):
             ph.setStyleSheet(f"color:{PAL['subtext']}; background:{PAL['surface']};")
             vl.addWidget(ph)
 
-        # ── Readout bar ───────────────────────────────────────────────────────
         readout_row = QHBoxLayout(); readout_row.setSpacing(16)
         readout_row.setContentsMargins(8, 0, 8, 2)
-
         def _ro_pair(label):
             lbl = QLabel(label)
             lbl.setStyleSheet(f"color:{PAL['subtext']}; font-size:8pt;")
@@ -232,20 +222,21 @@ class ScanPlot(QWidget):
                 f"min-width:90px;")
             readout_row.addWidget(lbl); readout_row.addWidget(val)
             return val
-
         self._ro_pos = _ro_pair("Position:")
         self._ro_int = _ro_pair("Intensity:")
         readout_row.addStretch()
         vl.addLayout(readout_row)
 
-        self._xs: list = []; self._ys: list = []
-        self._ys_accum: "np.ndarray | None" = None
+        # Accumulator state
+        self._xs: list  = []          # mirror of _xs_accum for cursor snap
+        self._ys: list  = []          # mirror of mean for cursor snap
         self._xs_accum: list = []
-        self._xs_accum_ptr: int = 0   # write pointer for subsequent reps
-        self._n_accum  = 0
-        self._accum_seeded = False
-        self._n_scans_total = 1
+        self._ys_accum  = None        # numpy array, sum across reps
+        self._xs_accum_ptr: int = 0   # write index for rep N>0
+        self._n_accum: int = 0        # completed reps
+        self._n_scans_total: int = 1
 
+    # ── Axis styling ──────────────────────────────────────────────────────────
     def _style_ax(self):
         ax = self._ax; ax.set_facecolor(PAL["bg"])
         for sp in ax.spines.values(): sp.set_color("#2a3a5e")
@@ -255,10 +246,14 @@ class ScanPlot(QWidget):
         ax.set_ylabel("Counts",         color=PAL["subtext"], fontsize=8)
         ax.set_title("No scan yet",     color=PAL["text"],    fontsize=9)
 
+    # ── Public API ────────────────────────────────────────────────────────────
     def reset(self, motor_lbl="Motor position", signal_lbl="Counts", title=""):
+        """Start a new scan: clear all data and reset accumulators."""
         self._xs.clear(); self._ys.clear()
+        self._xs_accum = []; self._ys_accum = None
+        self._xs_accum_ptr = 0; self._n_accum = 0
         if not MPL_AVAILABLE: return
-        self._line.set_data([], [])
+        self._accum_line.set_data([], [])
         self._ax.set_xlabel(motor_lbl,  color=PAL["subtext"], fontsize=8)
         self._ax.set_ylabel(signal_lbl, color=PAL["subtext"], fontsize=8)
         self._ax.set_title(title or "Scan in progress …",
@@ -266,54 +261,63 @@ class ScanPlot(QWidget):
         self._ax.set_xlim(0, 1); self._ax.set_ylim(0, 1)
         self._ax.autoscale(enable=True, axis="both")
         self._auto_scale = True
-        if MPL_AVAILABLE:
-            self._line.set_visible(True)
-            self._accum_line.set_visible(False)
-            self._accum_line.set_data([], [])
         self._canvas.draw_idle()
         self._ro_pos.setText("—"); self._ro_int.setText("—")
 
-    def _fit_to_data(self, extra_ys=None):
-        """Set axis limits to the full data range with padding."""
+    def start_accumulation(self, n_scans: int):
+        """Initialise for a multi-rep scan series."""
+        self._n_scans_total = n_scans
+        # Data cleared in reset(); just store the target count
+
+    def add_point_to_accum(self, x: float, y: float):
+        """Add one (x, y) point to the accumulator and redraw the mean line."""
+        import numpy as np
+        if self._n_accum == 0:
+            # Rep 0: build arrays
+            self._xs_accum.append(x)
+            if self._ys_accum is None:
+                self._ys_accum = np.array([y], dtype=float)
+            else:
+                self._ys_accum = np.append(self._ys_accum, y)
+        else:
+            # Rep N>0: accumulate into existing slot via write pointer
+            idx = self._xs_accum_ptr
+            if 0 <= idx < len(self._ys_accum):
+                self._ys_accum[idx] += y
+                self._xs_accum_ptr += 1
+                print(f"[accum] n={self._n_accum} ptr={self._xs_accum_ptr-1}→{self._xs_accum_ptr} x={x:.3f}")
+            else:
+                print(f"[accum] DROPPED n={self._n_accum} ptr={idx} len={len(self._ys_accum)} x={x:.3f}")
+                return   # out of bounds — ignore
         if not MPL_AVAILABLE:
             return
-        # When accumulating, scale to the accumulated mean line
-        if getattr(self, "_accum_seeded", False) and self._xs_accum and self._ys_accum is not None:
-            import numpy as np
-            mean = self._ys_accum / max(self._n_accum + 1, 1)
-            xs, ys = self._xs_accum, mean.tolist()
-        elif self._xs:
-            xs, ys = self._xs, list(self._ys) + (extra_ys or [])
-        else:
-            # Fallback: use whatever the line currently has (e.g. rep 0 frozen data)
-            xd, yd = self._line.get_data()
-            if not len(xd):
-                return
-            xs, ys = list(xd), list(yd)
-        if not xs or not ys:
-            return
-        xmin, xmax = min(xs), max(xs)
-        ymin, ymax = min(ys), max(ys)
-        xspan = xmax - xmin
-        yspan = ymax - ymin
-        xpad = xspan * 0.02 if xspan else abs(xmax) * 0.01 or 0.5
-        ypad = yspan * 0.05 if yspan else abs(ymax) * 0.05 or abs(ymax) * 0.01 or 1e-10
-        self._ax.set_xlim(xmin - xpad, xmax + xpad)
-        self._ax.set_ylim(ymin - ypad, ymax + ypad)
-        self._canvas.draw_idle()
-
-    def add_point(self, x, y):
-        self._xs.append(x); self._ys.append(y)
-        if not MPL_AVAILABLE: return
-        self._line.set_data(self._xs, self._ys)
-        if getattr(self, "_auto_scale", True) and len(self._xs) >= 2:
+        # Always show mean = sum / max(n_accum, 1)  (rep 0: mean == raw data)
+        mean = self._ys_accum / max(self._n_accum, 1)
+        self._accum_line.set_data(self._xs_accum, mean.tolist())
+        # Mirror into _xs/_ys for cursor snap
+        self._xs = list(self._xs_accum)
+        self._ys = mean.tolist()
+        if getattr(self, "_auto_scale", True) and len(self._xs_accum) >= 2:
             self._fit_to_data()
         self._canvas.draw_idle()
 
-    def _on_btn_release(self, ev):
-        """Disable auto-scaling once the user manually pans or zooms."""
-        if hasattr(self, "_toolbar") and self._toolbar.mode:
-            self._auto_scale = False
+    def finish_accum_rep(self):
+        """Finalise a completed rep and reset write pointer for the next."""
+        self._n_accum += 1
+        self._xs_accum_ptr = 0
+
+    def redraw_accum(self):
+        """Full redraw of the mean line — called after final rep completes."""
+        if self._ys_accum is None or not self._xs_accum or not MPL_AVAILABLE:
+            return
+        import numpy as np
+        mean = self._ys_accum / max(self._n_accum, 1)
+        self._accum_line.set_data(self._xs_accum, mean.tolist())
+        self._xs = list(self._xs_accum)
+        self._ys = mean.tolist()
+        if getattr(self, "_auto_scale", True):
+            self._fit_to_data()
+        self._canvas.draw_idle()
 
     def finish(self, title=""):
         if not MPL_AVAILABLE: return
@@ -321,96 +325,49 @@ class ScanPlot(QWidget):
                            color=PAL["ok"], fontsize=9)
         self._canvas.draw_idle()
 
-    def start_accumulation(self, n_scans: int):
-        """Call before the first repetition to initialise the accumulator."""
-        import numpy as np
-        self._n_scans_total = n_scans
-        self._ys_accum      = None
-        self._xs_accum      = []
-        self._xs_accum_ptr  = 0
-        self._n_accum       = 0
-        self._accum_seeded  = False
-        if MPL_AVAILABLE:
-            self._accum_line.set_data([], [])
-            self._accum_line.set_visible(False)
-            self._line.set_visible(True)
-            self._canvas.draw_idle()
-
-    def add_point_to_accum(self, x: float, y: float):
-        """Add a single point to the running accumulator (called live per point)."""
-        import numpy as np
-        if not self._accum_seeded:
-            # First rep — build accum arrays alongside current scan
-            self._xs_accum.append(x)
-            if self._ys_accum is None:
-                self._ys_accum = np.array([y], dtype=float)
-            else:
-                self._ys_accum = np.append(self._ys_accum, y)
-        else:
-            # Subsequent reps — use write pointer
-            idx = self._xs_accum_ptr
-            if 0 <= idx < len(self._ys_accum):
-                self._ys_accum[idx] += y
-                self._xs_accum_ptr += 1
-                # Redraw accumulated mean line live
-                if MPL_AVAILABLE:
-                    mean = self._ys_accum[:idx+1] / (self._n_accum + 1)
-                    self._accum_line.set_data(
-                        self._xs_accum[:idx+1], mean.tolist())
-                    self._accum_line.set_visible(True)
-                    if getattr(self, "_auto_scale", True):
-                        self._fit_to_data()
-                    self._canvas.draw_idle()
-
-    def update_point(self, idx: int, y: float):
-        """Replace the y-value of an existing point and redraw the current line."""
-        if not MPL_AVAILABLE or idx < 0 or idx >= len(self._ys):
-            return
-        self._ys[idx] = y
-        self._line.set_data(self._xs, self._ys)
-        if getattr(self, "_auto_scale", True):
-            self._fit_to_data()
-        self._canvas.draw_idle()
-
-    def finish_accum_rep(self):
-        """Called at the end of each rep to increment the rep counter."""
-        self._n_accum += 1
-        self._accum_seeded = True
-
-    def redraw_accum(self):
-        """Redraw the accumulated mean line and hide the current-scan line."""
-        if self._ys_accum is None or not self._xs_accum or not MPL_AVAILABLE:
-            return
-        import numpy as np
-        mean = self._ys_accum / max(self._n_accum, 1)
-        self._accum_line.set_data(self._xs_accum, mean.tolist())
-        self._accum_line.set_visible(True)
-        self._accum_line.set_label(
-            f"Accumulated ({self._n_accum}/{self._n_scans_total})")
-        self._line.set_visible(False)
-        if getattr(self, "_auto_scale", True):
-            self._fit_to_data()
-        self._canvas.draw_idle()
-
     def save_accumulated(self, path: str):
-        """Write the accumulated (mean) spectrum to an HDF5 file."""
+        """Write the accumulated mean spectrum to HDF5."""
         if self._ys_accum is None or not self._xs_accum:
             return
         import numpy as np
         try:
             import h5py
             p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
-            mean = self._ys_accum / max(self._n_accum, 1)
+            n = max(self._n_accum, 1)
             with h5py.File(p, "w") as f:
                 f.create_dataset("entry/motor_positions",
                                  data=np.asarray(self._xs_accum))
                 f.create_dataset("entry/mean_counts",
-                                 data=mean)
+                                 data=self._ys_accum / n)
                 f.create_dataset("entry/sum_counts",
                                  data=self._ys_accum)
                 f["entry"].attrs["n_accumulated"] = self._n_accum
         except Exception as e:
             print(f"[ScanPlot] save_accumulated error: {e}")
+
+    # ── Axis scaling ──────────────────────────────────────────────────────────
+    def _fit_to_data(self, extra_ys=None):
+        if not MPL_AVAILABLE or not self._xs_accum or self._ys_accum is None:
+            return
+        import numpy as np
+        mean = self._ys_accum / max(self._n_accum, 1)
+        xs = self._xs_accum
+        ys = mean.tolist() + (extra_ys or [])
+        xmin, xmax = min(xs), max(xs)
+        ymin, ymax = min(ys), max(ys)
+        xspan = xmax - xmin; yspan = ymax - ymin
+        xpad = xspan * 0.02 if xspan else abs(xmax) * 0.01 or 0.5
+        ypad = yspan * 0.05 if yspan else abs(ymax) * 0.05 or abs(ymax) * 0.01 or 1e-10
+        self._ax.set_xlim(xmin - xpad, xmax + xpad)
+        self._ax.set_ylim(ymin - ypad, ymax + ypad)
+
+    def _on_btn_release(self, ev):
+        if hasattr(self, "_toolbar") and self._toolbar.mode:
+            self._auto_scale = False
+
+    # legacy — keep for local scan engine compatibility
+    def add_point(self, x, y):
+        self.add_point_to_accum(x, y)
 
     # ── Cursor ────────────────────────────────────────────────────────────────
     def _on_mouse_move(self, ev):
@@ -823,7 +780,9 @@ class DAQTab(QWidget):
 
         if not self._qs_active:
             self._qs_active       = True
-            self._qs_scan_started = False
+            self._qs_scan_started = True
+            self._qs_raw_xs: list = []
+            self._qs_wait_total   = 0.0
             self._qs_t0           = time.monotonic()
             self._xas_plot.reset(motor_lbl, det_lbl,
                                  f"QServer: {plan_name}  (waiting…)")
@@ -847,70 +806,44 @@ class DAQTab(QWidget):
 
     def _on_qs_running_item(self, item: dict) -> None:
         """Called when the queue server starts or finishes a scan."""
+
         # ── Queue went idle ───────────────────────────────────────────────────
         if not item:
-            if self._qs_callback_connected:
-                PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
-                self._qs_callback_connected = False
             if self._qs_active:
                 self._qs_elapsed_timer.stop()
                 self._qs_final_t = time.monotonic() - self._qs_t0
-                # Don't snapshot here — let 500ms settle so all PV
-                # callbacks deliver, then read _xs live in _finish_rep_and_save
-                QTimer.singleShot(500, self._finish_rep_and_save)
+                # Don't disconnect callback yet — late callbacks may still arrive.
+                # Disconnect inside _finish_rep_and_save after the delay.
+                QTimer.singleShot(1500, self._finish_rep_and_save)
             return
 
-        # ── New scan starting ─────────────────────────────────────────────────
+        # ── New scan / rep starting ───────────────────────────────────────────
         plan      = item.get("name", "?")
         args      = item.get("args", [])
         uid_short = item.get("item_uid", "")[:8]
         rep_total = getattr(self, "_xas_rep_total", 1)
 
         if self._qs_active:
-            if not self._qs_scan_started:
-                # First scan start — retroactively accumulate pre-signal points
-                self._qs_scan_started = True
-                for x, y in zip(self._xas_plot._xs, self._xas_plot._ys):
-                    self._xas_plot.add_point_to_accum(x, y)
-                # Don't clear the line — keep partial trace visible
-            else:
-                # Genuine rep boundary
-                plot  = self._xas_plot
-                n_rep = self._qs_n_steps or len(plot._xs_accum) or len(plot._xs)
+            plot  = self._xas_plot
+            n_rep = self._qs_n_steps or 0
+            is_boundary = (n_rep > 0 and len(plot._xs_accum) >= n_rep)
 
-                completed_xs = list(plot._xs[:n_rep])
-                completed_ys = list(plot._ys[:n_rep])
-                overflow_xs  = list(plot._xs[n_rep:])
-                overflow_ys  = list(plot._ys[n_rep:])
-
-                # Flush any missing completed-rep points into accumulator
-                already = len(plot._xs_accum)
-                for x, y in zip(completed_xs[already:], completed_ys[already:]):
-                    plot.add_point_to_accum(x, y)
-
-                # Finalise rep and draw the mean line before resetting write state
-                plot.finish_accum_rep()   # _n_accum += 1, _accum_seeded = True
+            if is_boundary:
+                # Genuine rep boundary — trim to exactly n_rep pts and finalise
+                if len(plot._xs_accum) > n_rep:
+                    import numpy as np
+                    plot._xs_accum = plot._xs_accum[:n_rep]
+                    plot._ys_accum = plot._ys_accum[:n_rep]
+                plot.finish_accum_rep()
                 self._xas_rep_idx += 1
-                plot.redraw_accum()       # draw mean = _ys_accum / _n_accum
-
-                # Reset ONLY the write pointer — keep _ys_accum/_xs_accum intact
-                # so subsequent reps add to the running sum
+                plot.redraw_accum()
                 plot._xs_accum_ptr = 0
-                # Clear _xs/_ys so no new points append to the frozen rep-0 line
-                plot._xs.clear(); plot._ys.clear()
-                # Don't hide or clear _line — rep 0 trace stays visible
+                self._qs_raw_xs = []
 
-                # Feed overflow into the new rep's accumulator
-                for x, y in zip(overflow_xs, overflow_ys):
-                    plot.add_point_to_accum(x, y)
-
-            rep_now = self._xas_rep_idx + 1        # 1-based for display
-
+            rep_now = self._xas_rep_idx + 1
             self._log_msg(
                 f"🗂 QServer: rep {rep_now}/{rep_total}  uid=…{uid_short}",
                 PAL["accent"])
-
-            self._xas_plot._line.set_data([], [])
             title = (f"QServer: {plan}  rep {rep_now}/{rep_total}  (…{uid_short})"
                      if rep_total > 1 else
                      f"QServer: {plan}  (…{uid_short})")
@@ -920,9 +853,7 @@ class DAQTab(QWidget):
             self._st_file.setText(f"{plan} · rep {rep_now}/{rep_total}")
             self._qs_active = True
             self._qs_t0     = time.monotonic()
-            self._qs_last_x = None
             self._qs_elapsed_timer.start()
-            # Don't call _qs_record_now here — motor callbacks handle first point
             return
 
         # ── First scan starting (safety net / external client) ────────────────
@@ -963,23 +894,55 @@ class DAQTab(QWidget):
         self._st_file.setText(f"{plan} · …{uid_short}")
 
     def _finish_rep_and_save(self):
-        """Called 500 ms after queue goes idle; finalises accumulation and saves."""
+        """Finalise accumulation and save. Retries every 200ms until all points
+        have arrived or a 5s timeout is reached."""
+        plot  = self._xas_plot
+        n_rep = self._qs_n_steps
+
+        # For rep N>0, _xs_accum_ptr tracks how many points were written this rep.
+        # For rep 0 (n_accum==0), len(_xs_accum) is the point count.
+        if n_rep > 0:
+            if plot._n_accum == 0:
+                pts_this_rep = len(plot._xs_accum)
+            else:
+                pts_this_rep = plot._xs_accum_ptr
+
+            elapsed_wait = time.monotonic() - getattr(self, "_qs_final_t", 0.0)
+            wait_total   = getattr(self, "_qs_wait_total", 0.0)
+
+            if pts_this_rep < n_rep and wait_total < 5.0:
+                # Not all points arrived yet — retry in 200ms
+                self._qs_wait_total = wait_total + 0.2
+                QTimer.singleShot(200, self._finish_rep_and_save)
+                return
+
+        # All points received (or timeout) — disconnect and finalise
+        print(f"[finish] proceeding: n_accum={plot._n_accum} ptr={plot._xs_accum_ptr} n_rep={n_rep}")
+        if self._qs_callback_connected:
+            PVMonitor().value_changed.disconnect(self._on_qs_motor_callback)
+            self._qs_callback_connected = False
         self._qs_active       = False
         self._qs_scan_started = False
-        elapsed    = getattr(self, "_qs_final_t", 0.0)
+        self._qs_wait_total   = 0.0
+        elapsed    = time.monotonic() - getattr(self, "_qs_t0", time.monotonic())
         rep_total  = getattr(self, "_xas_rep_total", 1)
         accum_file = getattr(self, "_xas_accum_file", "")
 
-        # Finalise the last rep's contribution to the accumulator
-        if self._xas_plot._xs:
-            self._xas_plot.finish_accum_rep()
-            self._xas_rep_idx += 1
+        # Trim to exactly n_rep points
+        if n_rep and plot._ys_accum is not None:
+            import numpy as np
+            if len(plot._xs_accum) > n_rep:
+                plot._xs_accum = plot._xs_accum[:n_rep]
+                plot._ys_accum = plot._ys_accum[:n_rep]
 
-        # Redraw accumulated mean line from the now-complete accumulator
-        self._xas_plot.redraw_accum()
+        # Finalise the last rep
+        plot.finish_accum_rep()
+        self._xas_rep_idx += 1
 
+        # Redraw and save
+        plot.redraw_accum()
         if accum_file:
-            self._xas_plot.save_accumulated(accum_file)
+            plot.save_accumulated(accum_file)
 
         if rep_total > 1:
             self._log_msg(
@@ -1027,15 +990,12 @@ class DAQTab(QWidget):
             raw = PVMonitor().get(self._qs_det_pv)
             y = float(raw) if raw is not None else float("nan")
         else:
-            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
+            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs_accum))
 
-        # Rep 0: append to build the display line.
-        # Subsequent reps: don't append — keep _xs/_ys frozen at rep 0 data.
-        if not self._xas_plot._accum_seeded:
-            self._xas_plot.add_point(x, y)
-        if self._qs_scan_started:
-            self._xas_plot.add_point_to_accum(x, y)
-        n_pts = len(self._xas_plot._xs)
+        self._xas_plot.add_point_to_accum(x, y)
+        if hasattr(self, "_qs_raw_xs"):
+            self._qs_raw_xs.append(x)
+        n_pts = len(self._xas_plot._xs_accum)
         n     = self._qs_n_steps
         self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
         if n:
@@ -1075,13 +1035,12 @@ class DAQTab(QWidget):
             raw_y = PVMonitor().get(self._qs_det_pv)
             y = float(raw_y) if raw_y is not None else float("nan")
         else:
-            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs))
+            y = sim_scalar([{"_x": x}], len(self._xas_plot._xs_accum))
 
-        if not self._xas_plot._accum_seeded:
-            self._xas_plot.add_point(x, y)
-        if self._qs_scan_started:
-            self._xas_plot.add_point_to_accum(x, y)
-        n_pts = len(self._xas_plot._xs)
+        self._xas_plot.add_point_to_accum(x, y)
+        if hasattr(self, "_qs_raw_xs"):
+            self._qs_raw_xs.append(x)
+        n_pts = len(self._xas_plot._xs_accum)
         n     = self._qs_n_steps
         self._st_point.setText(f"{n_pts}" + (f" / {n}" if n else ""))
         if n:
