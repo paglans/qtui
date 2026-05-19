@@ -297,3 +297,5 @@ except ImportError as _imp_e:
 # ── Convenience aliases ─────────────────────────────────────────────
 # Add any extra devices, callbacks, or subscriptions here.
 
+from nxxas_writer import make_nxxas_factory
+RE.subscribe(_RunRouter([make_nxxas_factory(_EXPORT_DIR)]))
